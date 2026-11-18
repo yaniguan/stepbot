@@ -1,0 +1,46 @@
+metadata:
+  name: Plate fill for absorbance read
+  description: Distribute buffer and add dye or water across row A for a plate read
+
+deck:
+  plate:
+    labware: corning_96_wellplate_360ul_flat
+    slot: 1
+  reservoir:
+    labware: nest_12_reservoir_15ml
+    slot: 2
+  tips:
+    labware: opentrons_96_tiprack_300ul
+    slot: 3
+
+pipettes:
+  left:
+    model: p300_single_gen2
+    tip_racks:
+      - tips
+
+steps:
+  - comment: Distribute buffer into row A wells A1-A8
+  - distribute:
+      src: reservoir:A1
+      dst: plate:A1-A8
+      volume: 150
+      new_tip: once
+  - comment: Add dye to A1-A4 and water blanks to A5-A8
+  - transfer:
+      src: reservoir:A2
+      dst: plate:A1-A4
+      volume: 50
+      new_tip: always
+  - transfer:
+      src: reservoir:A3
+      dst: plate:A5-A8
+      volume: 50
+      new_tip: once
+  - mix:
+      wells: plate:A1-A8
+      volume: 100
+      reps: 3
+      new_tip: always
+  - delay:
+      seconds: 10

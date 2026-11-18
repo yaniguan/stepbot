@@ -1,0 +1,33 @@
+metadata:
+  name: Two-fold dilution series
+  description: Two-fold serial dilution of dye in buffer across row A
+
+deck:
+  plate:
+    labware: corning_96_wellplate_360ul_flat
+    slot: 1
+  reservoir:
+    labware: nest_12_reservoir_15ml
+    slot: 2
+  tips:
+    labware: opentrons_96_tiprack_300ul
+    slot: 3
+
+pipettes:
+  left:
+    model: p300_single_gen2
+    tip_racks:
+      - tips
+
+steps:
+  - comment: Prepare 2-fold dye dilution series across row A
+  - dilution_series:
+      source: reservoir:A1
+      diluent: reservoir:A2
+      first_well: plate:A1
+      n: 8
+      factor: 2
+      final_volume: 100
+      mix_reps: 3
+  - delay:
+      seconds: 5

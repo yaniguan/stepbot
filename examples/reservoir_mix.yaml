@@ -1,0 +1,52 @@
+metadata:
+  name: Reservoir to plate mix
+  description: Fill a 24-well plate with water and dye from a 12-well reservoir and mix
+
+deck:
+  plate:
+    labware: corning_24_wellplate_3.4ml_flat
+    slot: 1
+  reservoir:
+    labware: nest_12_reservoir_15ml
+    slot: 2
+  tips_300:
+    labware: opentrons_96_tiprack_300ul
+    slot: 3
+  tips_20:
+    labware: opentrons_96_tiprack_20ul
+    slot: 4
+
+pipettes:
+  left:
+    model: p300_single_gen2
+    tip_racks:
+      - tips_300
+  right:
+    model: p20_single_gen2
+    tip_racks:
+      - tips_20
+
+steps:
+  - comment: Pre-fill row A with water
+  - distribute:
+      pipette: left
+      src: reservoir:A1
+      dst: plate:A1-A6
+      volume: 250
+      new_tip: once
+  - comment: Spike dye into row A using p20 pipette
+  - transfer:
+      pipette: right
+      src: reservoir:A2
+      dst: plate:A1-A6
+      volume: 15
+      new_tip: always
+  - comment: Mix each well in row A
+  - mix:
+      pipette: left
+      wells: plate:A1-A6
+      volume: 150
+      reps: 4
+      new_tip: always
+  - pause:
+      seconds: 3
