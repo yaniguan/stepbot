@@ -26,6 +26,14 @@ pipettes:
     tip_racks:
       - tips_20
 
+liquids:
+  water:
+    wells: reservoir:A1
+    volume: 5000
+  dye:
+    wells: reservoir:A2
+    volume: 1000
+
 steps:
   - comment: Pre-fill row A with water
   - distribute:

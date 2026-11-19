@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import ast
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from stepbot.catalog import get_labware_spec, get_pipette_spec
+from stepbot.catalog import (
+    get_labware_spec,
+    get_pipette_spec,
+    installed_max_api_level,
+    parse_api_level,
+)
 from stepbot.models import LabwareSpec, PipetteSpec
 
 
@@ -27,14 +33,49 @@ class _MockTrash:
         return "Trash Bin on slot 12"
 
 
+_VOLUME_TOLERANCE = 1e-6
+
+
 @dataclass(frozen=True)
+class _MockLiquid:
+    name: str
+    description: str | None = None
+    display_color: str | None = None
+
+
+@dataclass(eq=False)
 class _MockWell:
     labware_name: str
     slot: int
     well_name: str
+    max_volume: float
+    volume: float = field(default=0.0)
 
     def __str__(self) -> str:
         return f"{self.well_name} of {self.labware_name} on slot {self.slot}"
+
+    def load_liquid(self, liquid: _MockLiquid, volume: float) -> None:
+        if volume < 0 or volume > self.max_volume + _VOLUME_TOLERANCE:
+            raise ValueError(
+                f"Cannot load {volume} uL of '{liquid.name}' into {self}: "
+                f"well capacity is {self.max_volume} uL"
+            )
+        self.volume = float(volume)
+
+    def remove_volume(self, volume: float) -> None:
+        if volume > self.volume + _VOLUME_TOLERANCE:
+            raise ValueError(
+                f"Cannot aspirate {volume} uL from {self}: well holds only {self.volume:.2f} uL"
+            )
+        self.volume = max(0.0, self.volume - volume)
+
+    def add_volume(self, volume: float) -> None:
+        if self.volume + volume > self.max_volume + _VOLUME_TOLERANCE:
+            raise ValueError(
+                f"Cannot dispense {volume} uL into {self}: would hold "
+                f"{self.volume + volume:.2f} uL, above well capacity {self.max_volume} uL"
+            )
+        self.volume += volume
 
 
 class _MockLabware:
@@ -43,7 +84,7 @@ class _MockLabware:
         self.slot = slot
         self.spec = spec
         self._wells = {
-            w: _MockWell(load_name, slot, w) for w in spec.wells
+            w: _MockWell(load_name, slot, w, spec.max_volume) for w in spec.wells
         }
 
     def __getitem__(self, well_name: str) -> _MockWell:
@@ -118,6 +159,8 @@ class _MockInstrumentContext:
             raise ValueError(
                 f"Cannot aspirate {volume} uL: exceeds max volume {self.spec.max_volume} uL"
             )
+        if isinstance(location, _MockWell):
+            location.remove_volume(volume)
         self.current_volume += volume
         self._log.append(f"Aspirating {volume:.1f} uL from {location}")
 
@@ -127,6 +170,8 @@ class _MockInstrumentContext:
             raise ValueError(
                 f"Cannot dispense {volume} uL with {self.current_volume:.2f} uL aspirated"
             )
+        if isinstance(location, _MockWell):
+            location.add_volume(volume)
         self.current_volume = max(0.0, self.current_volume - volume)
         self._log.append(f"Dispensing {volume:.1f} uL into {location}")
 
@@ -259,6 +304,14 @@ class MockProtocolContext:
         self._mounts[mount] = inst
         return inst
 
+    def define_liquid(
+        self,
+        name: str,
+        description: str | None = None,
+        display_color: str | None = None,
+    ) -> _MockLiquid:
+        return _MockLiquid(name=name, description=description, display_color=display_color)
+
     def comment(self, msg: str) -> None:
         self.log.append(f"Comment: {msg}")
 
@@ -270,11 +323,61 @@ class MockProtocolContext:
         self.log.append(f"Pausing: {msg}" if msg else "Pausing")
 
 
+def _read_api_level(source: str) -> str | None:
+    """Return metadata['apiLevel'] from protocol source without executing it."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "metadata" for t in node.targets)
+        ):
+            try:
+                metadata = ast.literal_eval(node.value)
+            except ValueError:
+                return None
+            if isinstance(metadata, dict):
+                level = metadata.get("apiLevel")
+                return level if isinstance(level, str) else None
+    return None
+
+
+def api_level_error(api_level: str | None, max_supported: tuple[int, int]) -> str | None:
+    """Return an error message if api_level is malformed or newer than max_supported."""
+    if api_level is None:
+        return "Protocol metadata has no string 'apiLevel'"
+    try:
+        requested = parse_api_level(api_level)
+    except ValueError:
+        return f"Protocol apiLevel '{api_level}' is not of the form '<major>.<minor>'"
+    if requested > max_supported:
+        return (
+            f"Protocol apiLevel '{api_level}' is newer than the installed opentrons supports "
+            f"(max {max_supported[0]}.{max_supported[1]}); upgrade opentrons or set an older "
+            "metadata.apiLevel in the YAML/JSON input and recompile"
+        )
+    return None
+
+
 def _check_with_opentrons(path: Path) -> CheckResult | None:
     try:
         from opentrons import simulate as ot_simulate
     except ImportError:
         return None
+    max_supported = installed_max_api_level()
+    if max_supported is not None:
+        error = api_level_error(_read_api_level(path.read_text(encoding="utf-8")), max_supported)
+        if error is not None:
+            return CheckResult(
+                backend="opentrons",
+                ok=False,
+                command_count=0,
+                line_count=0,
+                lines=(),
+                errors=(error,),
+            )
     try:
         with path.open("r", encoding="utf-8") as handle:
             runlog, _ = ot_simulate.simulate(handle, file_name=str(path))

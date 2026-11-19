@@ -63,6 +63,22 @@ def render_protocol(spec: ProtocolSpec) -> str:
         )
     lines.append("")
 
+    if spec.liquids:
+        lines.append("    liquids = {")
+        for liquid in spec.liquids:
+            lines.append(
+                f"        {liquid.name!r}: protocol.define_liquid({liquid.name!r}, "
+                f"description={liquid.description!r}, display_color=None),"
+            )
+        lines.append("    }")
+        for liquid in spec.liquids:
+            for well in liquid.wells:
+                lines.append(
+                    f"    {well.expr()}.load_liquid(liquid=liquids[{liquid.name!r}], "
+                    f"volume={_fmt_num(liquid.volume)})"
+                )
+        lines.append("")
+
     for step in spec.steps:
         if isinstance(step, CommentStep):
             lines.append(f"    protocol.comment({step.text!r})")
