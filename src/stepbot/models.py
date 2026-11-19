@@ -63,6 +63,16 @@ class WellRef:
 
 
 @dataclass(frozen=True)
+class LiquidSpec:
+    """A named liquid loaded into wells before the protocol starts."""
+
+    name: str
+    description: str
+    wells: tuple[WellRef, ...]
+    volume: float
+
+
+@dataclass(frozen=True)
 class CommentStep:
     """Emit a protocol comment."""
 
@@ -162,3 +172,4 @@ class ProtocolSpec:
     deck: dict[str, DeckItem]
     pipettes: dict[str, PipetteConfig]
     steps: list[LoweredStep] = field(default_factory=list)
+    liquids: tuple[LiquidSpec, ...] = ()
