@@ -247,7 +247,7 @@ def test_source_running_dry_rejected() -> None:
     data["steps"] = [
         {"distribute": {"src": "reservoir:A1", "dst": "plate:A1-A2", "volume": 100}},
     ]
-    with pytest.raises(ValidationError, match="aspirating 200 uL.*holds only 150 uL"):
+    with pytest.raises(ValidationError, match="aspirating 220 uL.*holds only 150 uL"):
         compile_protocol(data)
 
 

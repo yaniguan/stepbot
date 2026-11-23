@@ -32,5 +32,6 @@ def run(protocol):
     pipette_left.transfer(100, plate["A7"], plate["A8"], new_tip='never', mix_after=(3, 100))
     pipette_left.aspirate(100, plate["A8"])
     pipette_left.dispense(100, protocol.fixed_trash)
+    pipette_left.blow_out(protocol.fixed_trash)
     pipette_left.drop_tip()
     protocol.delay(seconds=5)

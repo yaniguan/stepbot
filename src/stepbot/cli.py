@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from stepbot.checker import check_protocol
 from stepbot.compiler import compile_file
@@ -23,6 +23,12 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_cmd.add_argument("input", type=Path, help="Path to input YAML or JSON protocol.")
     compile_cmd.add_argument(
         "-o", "--output", type=Path, default=None, help="Output Python file path."
+    )
+    compile_cmd.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Optional output path for machine-readable JSON protocol manifest.",
     )
 
     check_cmd = sub.add_parser("check", help="Simulate and check a compiled protocol file.")
@@ -43,14 +49,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "compile":
         try:
-            source = compile_file(args.input, args.output)
-        except ValidationError as exc:
+            source = compile_file(
+                args.input,
+                args.output,
+                manifest_path=args.manifest,
+            )
+        except (ValidationError, OSError, UnicodeDecodeError) as exc:
             print(f"Validation error: {exc}", file=sys.stderr)
             return 1
         if args.output is None:
             sys.stdout.write(source)
         else:
             print(f"Wrote {args.output}")
+        if args.manifest is not None and args.output is not None:
+            print(f"Wrote manifest {args.manifest}")
         return 0
 
     if args.command == "check":
