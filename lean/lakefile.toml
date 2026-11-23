@@ -1,0 +1,6 @@
+name = "stepbotlean"
+version = "0.1.0"
+defaultTargets = ["StepbotLean"]
+
+[[lean_lib]]
+name = "StepbotLean"
