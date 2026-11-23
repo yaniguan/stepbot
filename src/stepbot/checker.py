@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import math
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -785,10 +786,9 @@ def _check_with_opentrons(path: Path) -> CheckResult | None:
         )
 
 
-def _check_with_mock(path: Path) -> CheckResult:
+def _check_source_with_mock(source: str, filename: str = "<protocol>") -> CheckResult:
     try:
-        source = path.read_text(encoding="utf-8")
-        metadata, run_def = _parse_safe_protocol_ast(source, str(path))
+        metadata, run_def = _parse_safe_protocol_ast(source, filename)
         parsed_level, fmt_err = _validate_api_level_format(metadata.get("apiLevel"))
         if fmt_err is not None or parsed_level is None:
             raise ValueError(fmt_err or "Invalid metadata['apiLevel']")
@@ -813,6 +813,33 @@ def _check_with_mock(path: Path) -> CheckResult:
             lines=(),
             errors=(str(exc),),
         )
+
+
+def _check_with_mock(path: Path) -> CheckResult:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return CheckResult(
+            backend="mock",
+            ok=False,
+            command_count=0,
+            line_count=0,
+            lines=(),
+            errors=(str(exc),),
+        )
+    return _check_source_with_mock(source, str(path))
+
+
+def check_protocol_source(source: str, *, use_mock: bool = False) -> CheckResult:
+    """Simulate an in-memory compiled Opentrons Python API v2 protocol string."""
+    if not use_mock:
+        with tempfile.TemporaryDirectory(prefix="stepbot_mcp_") as tmp_dir:
+            tmp_file = Path(tmp_dir) / "protocol.py"
+            tmp_file.write_text(source, encoding="utf-8", newline="\n")
+            real_result = _check_with_opentrons(tmp_file)
+            if real_result is not None:
+                return real_result
+    return _check_source_with_mock(source)
 
 
 def check_protocol(path: Path | str, *, use_mock: bool = False) -> CheckResult:

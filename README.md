@@ -45,10 +45,11 @@ stepbot/
 ├── src/stepbot/
 │   ├── catalog.py                # 24 standard labware specs, 12 pipette specs, API version helpers
 │   ├── checker.py                # opentrons.simulate wrapper + safe AST MockProtocolContext
-│   ├── cli.py                    # `stepbot compile` (--manifest) and `stepbot check` CLI
+│   ├── cli.py                    # `compile`, `check`, `mcp-compile`, and `mcp-dispatch` CLI
 │   ├── codegen.py                # Slot/mount-sorted Python API v2 & JSON manifest emitter
 │   ├── compiler.py               # Strict schema validator, macro lowerer, tip/volume/lineage trackers
 │   ├── interop.py                # `from_twinstep` and `check_twinstep_protocol` bridge
+│   ├── mcp_runtime.py            # Zero-trust `lean-mcp/v1` envelope compiler & stateful executor
 │   ├── models.py                 # Frozen IR dataclasses and ValidationError
 │   └── wells.py                  # Well coordinate parser, row/col 2D range & serial expanders
 └── tests/                        # CLI, compiler, example-determinism, validation, and audit tests
@@ -73,6 +74,20 @@ Pass `--mock` to force the built-in mock simulator even when `opentrons` is inst
 ```bash
 stepbot check examples/out/dilution_series.py --mock
 stepbot check examples/out/dilution_series.py -v
+```
+
+## Zero-Trust Lean-MCP Hardware Dispatch (`lean-mcp/v1`)
+
+`stepbot.mcp_runtime` pairs deterministic `apiLevel 2.16` compilation with wire-compatible `lean-mcp/v1` capability envelopes shared with [`lab-verify`](https://github.com/yaniguan/lab-verify). Before executing a protocol on the simulator or deck, `StepbotMcpExecutor.dispatch` enforces:
+1. Canonical HMAC-SHA256 authenticity (`mcp_hmac_authentic`);
+2. Post-compile script SHA-256 binding (`mcp_payload_binding`);
+3. Physical deck epoch freshness (`token_epoch == current_deck_epoch`, `mcp_epoch_freshness`);
+4. Single-use `nonce` replay prevention (`mcp_nonce_single_use`);
+5. Zero-click autonomous execution inside the certified regime (`lean_proof_valid and not is_frontier_exception`) or human-supervisor co-signed frontier override (`mcp_proof_or_cosigned_exception`), monotonically advancing `current_deck_epoch += 1` upon execution.
+
+```bash
+stepbot mcp-compile examples/dilution_series.yaml -o out.py --envelope envelope.json --epoch 1 --secret-key "$LEAN_MCP_SECRET_KEY"
+stepbot mcp-dispatch out.py --envelope envelope.json --state deck_state.json --secret-key "$LEAN_MCP_SECRET_KEY" --mock --json
 ```
 
 ## Input format
