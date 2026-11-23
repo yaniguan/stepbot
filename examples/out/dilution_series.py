@@ -12,6 +12,13 @@ def run(protocol):
 
     pipette_left = protocol.load_instrument('p300_single_gen2', 'left', tip_racks=[tips])
 
+    liquids = {
+        'dye': protocol.define_liquid('dye', description='', display_color=None),
+        'buffer': protocol.define_liquid('buffer', description='', display_color=None),
+    }
+    reservoir["A1"].load_liquid(liquid=liquids['dye'], volume=2000)
+    reservoir["A2"].load_liquid(liquid=liquids['buffer'], volume=5000)
+
     protocol.comment('Prepare 2-fold dye dilution series across row A')
     pipette_left.distribute(100, reservoir["A2"], [plate["A2"], plate["A3"], plate["A4"], plate["A5"], plate["A6"], plate["A7"], plate["A8"]], new_tip='once')
     pipette_left.transfer(200, reservoir["A1"], plate["A1"], new_tip='once')
@@ -25,5 +32,6 @@ def run(protocol):
     pipette_left.transfer(100, plate["A7"], plate["A8"], new_tip='never', mix_after=(3, 100))
     pipette_left.aspirate(100, plate["A8"])
     pipette_left.dispense(100, protocol.fixed_trash)
+    pipette_left.blow_out(protocol.fixed_trash)
     pipette_left.drop_tip()
     protocol.delay(seconds=5)

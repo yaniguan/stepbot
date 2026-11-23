@@ -1,16 +1,21 @@
 """stepbot: compiler from simple protocol steps to Opentrons Python API v2."""
 
 from stepbot.checker import CheckResult, check_protocol
+from stepbot.codegen import build_protocol_manifest
 from stepbot.compiler import compile_file, compile_protocol, load_protocol_data, parse_and_validate
+from stepbot.interop import check_twinstep_protocol, from_twinstep
 from stepbot.models import ProtocolSpec, ValidationError
 
 __all__ = [
     "CheckResult",
     "ProtocolSpec",
     "ValidationError",
+    "build_protocol_manifest",
     "check_protocol",
+    "check_twinstep_protocol",
     "compile_file",
     "compile_protocol",
+    "from_twinstep",
     "load_protocol_data",
     "parse_and_validate",
 ]

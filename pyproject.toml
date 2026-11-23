@@ -21,7 +21,9 @@ sim = [
     "opentrons>=7.0,<9.0",
 ]
 dev = [
+    "mypy>=1.8",
     "pytest>=7.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -29,3 +31,21 @@ stepbot = "stepbot.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+
+[[tool.mypy.overrides]]
+module = [
+    "opentrons",
+    "opentrons.*",
+    "opentrons_shared_data",
+    "opentrons_shared_data.*",
+    "yaml",
+]
+ignore_missing_imports = true

@@ -19,6 +19,17 @@ pipettes:
     tip_racks:
       - tips
 
+liquids:
+  buffer:
+    wells: reservoir:A1
+    volume: 5000
+  dye:
+    wells: reservoir:A2
+    volume: 2000
+  water:
+    wells: reservoir:A3
+    volume: 2000
+
 steps:
   - comment: Distribute buffer into row A wells A1-A8
   - distribute:

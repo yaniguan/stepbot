@@ -2,7 +2,21 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from stepbot.models import LabwareSpec, PipetteSpec
+
+
+def row_index_to_label(row: int) -> str:
+    """Convert a 0-based row index to an Opentrons row label (0->'A', 25->'Z', 26->'AA')."""
+    if row < 0:
+        raise ValueError(f"row index must be >= 0, got {row}")
+    chars: list[str] = []
+    n = row + 1
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        chars.append(chr(ord("A") + rem))
+    return "".join(reversed(chars))
 
 
 def _grid_spec(
@@ -15,34 +29,44 @@ def _grid_spec(
 ) -> LabwareSpec:
     wells: list[str] = []
     well_grid: dict[str, tuple[int, int]] = {}
+    well_volumes: dict[str, float] = {}
     for col in range(cols):
         for row in range(rows):
-            name = f"{chr(ord('A') + row)}{col + 1}"
+            name = f"{row_index_to_label(row)}{col + 1}"
             wells.append(name)
             well_grid[name] = (row, col)
+            well_volumes[name] = max_volume
     return LabwareSpec(
         load_name=load_name,
         wells=tuple(wells),
         well_grid=well_grid,
         max_volume=max_volume,
         is_tiprack=is_tiprack,
+        well_volumes=well_volumes,
     )
 
 
 def _falcon_4x50_6x15_spec() -> LabwareSpec:
     load_name = "opentrons_10_tuberack_falcon_4x50ml_6x15ml_conical"
     coords = [
-        ("A1", 0, 0), ("B1", 1, 0), ("C1", 2, 0),
-        ("A2", 0, 1), ("B2", 1, 1), ("C2", 2, 1),
-        ("A3", 0, 2), ("B3", 1, 2),
-        ("A4", 0, 3), ("B4", 1, 3),
+        ("A1", 0, 0, 15000.0),
+        ("B1", 1, 0, 15000.0),
+        ("C1", 2, 0, 15000.0),
+        ("A2", 0, 1, 15000.0),
+        ("B2", 1, 1, 15000.0),
+        ("C2", 2, 1, 15000.0),
+        ("A3", 0, 2, 50000.0),
+        ("B3", 1, 2, 50000.0),
+        ("A4", 0, 3, 50000.0),
+        ("B4", 1, 3, 50000.0),
     ]
     return LabwareSpec(
         load_name=load_name,
-        wells=tuple(name for name, _, _ in coords),
-        well_grid={name: (r, c) for name, r, c in coords},
-        max_volume=15000.0,
+        wells=tuple(name for name, _, _, _ in coords),
+        well_grid={name: (r, c) for name, r, c, _ in coords},
+        max_volume=50000.0,
         is_tiprack=False,
+        well_volumes={name: vol for name, _, _, vol in coords},
     )
 
 
@@ -99,18 +123,49 @@ PIPETTE_CATALOG: dict[str, PipetteSpec] = {
 DEFAULT_API_LEVEL = "2.16"
 
 
+def is_tip_rack_compatible(pip_spec: PipetteSpec, rack_spec: LabwareSpec) -> bool:
+    """Return True if a tip rack's nozzle/volume family matches the pipette."""
+    if not rack_spec.is_tiprack:
+        return False
+    tip_vol = rack_spec.max_volume
+    if pip_spec.max_volume <= 20.0:
+        return 1.0 <= tip_vol <= 20.0
+    if pip_spec.max_volume <= 300.0:
+        return 50.0 <= tip_vol <= 300.0
+    return tip_vol > 300.0
+
+
+def expected_tip_family_description(pip_spec: PipetteSpec) -> str:
+    """Return human-readable compatible tip-rack volume range for error diagnostics."""
+    if pip_spec.max_volume <= 20.0:
+        return "10-20 uL"
+    if pip_spec.max_volume <= 300.0:
+        return "50-300 uL (e.g. 200 uL filter or 300 uL standard)"
+    return "1000 uL"
+
+
 def get_labware_spec(load_name: str) -> LabwareSpec | None:
     """Return a LabwareSpec for a standard Opentrons labware load name."""
     if load_name in LABWARE_CATALOG:
         return LABWARE_CATALOG[load_name]
     try:
-        from opentrons_shared_data.labware import load_definition
         from opentrons_shared_data.errors import PythonException
+        from opentrons_shared_data.labware import load_definition
     except ImportError:
         return None
+    defn: dict[str, Any] | None = None
     try:
-        defn = load_definition(load_name, 1)
+        defn = load_definition(load_name)
+    except TypeError:
+        for version in (3, 2, 1):
+            try:
+                defn = load_definition(load_name, version)
+                break
+            except (FileNotFoundError, KeyError, ValueError, PythonException):
+                continue
     except (FileNotFoundError, KeyError, ValueError, PythonException):
+        return None
+    if defn is None:
         return None
     wells: list[str] = []
     well_grid: dict[str, tuple[int, int]] = {}
@@ -118,13 +173,23 @@ def get_labware_spec(load_name: str) -> LabwareSpec | None:
         for row_idx, well_name in enumerate(col_wells):
             wells.append(well_name)
             well_grid[well_name] = (row_idx, col_idx)
-    first_well = defn["wells"][wells[0]]
+    well_volumes = {
+        w: float(defn["wells"][w]["totalLiquidVolume"]) for w in wells
+    }
+    is_tiprack = bool(defn["parameters"]["isTiprack"])
+    if not well_volumes:
+        max_volume = 0.0
+    elif is_tiprack:
+        max_volume = min(well_volumes.values())
+    else:
+        max_volume = max(well_volumes.values())
     return LabwareSpec(
         load_name=load_name,
         wells=tuple(wells),
         well_grid=well_grid,
-        max_volume=float(first_well["totalLiquidVolume"]),
-        is_tiprack=bool(defn["parameters"]["isTiprack"]),
+        max_volume=max_volume,
+        is_tiprack=is_tiprack,
+        well_volumes=well_volumes,
     )
 
 
@@ -133,14 +198,16 @@ def get_pipette_spec(model: str) -> PipetteSpec | None:
     return PIPETTE_CATALOG.get(model)
 
 
-def select_api_level() -> str:
-    """Pick a supported Opentrons Python API v2 level."""
+def parse_api_level(api_level: str) -> tuple[int, int]:
+    """Split an 'X.Y' API level string into an integer (major, minor) tuple."""
+    major, minor = api_level.split(".")
+    return int(major), int(minor)
+
+
+def installed_max_api_level() -> tuple[int, int] | None:
+    """Return the highest API level the installed opentrons supports, or None."""
     try:
         from opentrons.protocol_api import MAX_SUPPORTED_VERSION
     except ImportError:
-        return DEFAULT_API_LEVEL
-    major, minor = DEFAULT_API_LEVEL.split(".")
-    target = (int(major), int(minor))
-    max_ver = (MAX_SUPPORTED_VERSION.major, MAX_SUPPORTED_VERSION.minor)
-    chosen = min(target, max_ver)
-    return f"{chosen[0]}.{chosen[1]}"
+        return None
+    return int(MAX_SUPPORTED_VERSION.major), int(MAX_SUPPORTED_VERSION.minor)

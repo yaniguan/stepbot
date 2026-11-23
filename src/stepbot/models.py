@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
+
+VOLUME_TOLERANCE = 1e-6
 
 
 class ValidationError(ValueError):
@@ -18,6 +21,11 @@ class LabwareSpec:
     well_grid: dict[str, tuple[int, int]]
     max_volume: float
     is_tiprack: bool = False
+    well_volumes: dict[str, float] = field(default_factory=dict)
+
+    def max_volume_for(self, well: str) -> float:
+        """Return the liquid capacity (uL) of a specific well."""
+        return self.well_volumes.get(well, self.max_volume)
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,14 @@ class PipetteConfig:
     model: str
     tip_racks: tuple[str, ...]
     spec: PipetteSpec
+    max_tip_volume: float | None = None
+
+    @property
+    def effective_max_volume(self) -> float:
+        """Return maximum single-stroke volume bounded by both pipette and tip racks."""
+        if self.max_tip_volume is None:
+            return self.spec.max_volume
+        return min(self.spec.max_volume, self.max_tip_volume)
 
 
 @dataclass(frozen=True)
@@ -61,6 +77,20 @@ class WellRef:
         """Return the Python expression referencing this well."""
         return f'{self.labware}["{self.well}"]'
 
+    def key(self) -> str:
+        """Return canonical '<labware>:<well>' string."""
+        return f"{self.labware}:{self.well}"
+
+
+@dataclass(frozen=True)
+class LiquidSpec:
+    """A named liquid loaded into wells before the protocol starts."""
+
+    name: str
+    description: str
+    wells: tuple[WellRef, ...]
+    volume: float
+
 
 @dataclass(frozen=True)
 class CommentStep:
@@ -71,9 +101,10 @@ class CommentStep:
 
 @dataclass(frozen=True)
 class DelayStep:
-    """Pause the protocol for a duration in seconds."""
+    """Pause the protocol for a duration in seconds and/or minutes."""
 
-    seconds: float
+    seconds: float = 0.0
+    minutes: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +149,7 @@ class DistributeStep:
     dst: tuple[WellRef, ...]
     volume: float
     new_tip: str = "once"
+    disposal_volume: float | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +169,7 @@ class DiscardStep:
     pipette: str
     src: WellRef
     volume: float
+    strokes: int = 1
 
 
 LoweredStep = (
@@ -153,6 +186,25 @@ LoweredStep = (
 
 
 @dataclass(frozen=True)
+class WellSummary:
+    """Initial, peak, and final volume plus species lineage for a well."""
+
+    initial_ul: float
+    peak_ul: float
+    final_ul: float
+    capacity_ul: float
+    species: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StepOrigin:
+    """Mapping from a lowered step back to its 1-based source YAML/JSON step."""
+
+    source_step_index: int | None
+    source_step_type: str
+
+
+@dataclass(frozen=True)
 class ProtocolSpec:
     """Validated protocol definition ready for code generation."""
 
@@ -162,3 +214,15 @@ class ProtocolSpec:
     deck: dict[str, DeckItem]
     pipettes: dict[str, PipetteConfig]
     steps: list[LoweredStep] = field(default_factory=list)
+    liquids: tuple[LiquidSpec, ...] = ()
+    tips_used_per_rack: dict[str, int] = field(default_factory=dict)
+    tips_used_per_mount: dict[str, int] = field(default_factory=dict)
+    well_summaries: dict[str, WellSummary] = field(default_factory=dict)
+    step_origins: tuple[StepOrigin, ...] = ()
+
+    def to_manifest_meta(self) -> dict[str, Any]:
+        """Return static analysis summary fields for JSON manifest emission."""
+        return {
+            "tips_used_per_rack": dict(self.tips_used_per_rack),
+            "tips_used_per_mount": dict(self.tips_used_per_mount),
+        }
