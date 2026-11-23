@@ -16,6 +16,43 @@ With the Opentrons Python API v2 simulator and test dependencies:
 pip install -e ".[sim,dev]"
 ```
 
+## System Profile: Object · Data · Model · Training · History · Unique Properties
+
+`stepbot` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L1 · Protocol Compiler & Visuo-Tactile Manipulation`**.
+
+- **Object**: Deterministic liquid-handling compiler and dual-backend verifier translating declarative YAML/JSON protocols into idiomatic Opentrons Python API v2 scripts (`apiLevel` `2.16`).
+- **Data**: Declarative protocol schema (`metadata`, `deck`, `pipettes`, optional `liquids` on `origin/review-fixes`, and `steps`), built-in catalog of `24` Opentrons labware definitions and `12` Gen1/Gen2 pipettes, and `3` end-to-end YAML/Python example pairs.
+- **Model**: Four-stage pipeline (`wells.py` 2D grid/range resolver -> `compiler.py` step lowerer, `dilution_series` macro expander, `_TipStateTracker` automaton, and `_WellVolumeTracker` -> `codegen.py` slot/mount-sorted Python emitter -> `checker.py` `opentrons.simulate` + `MockProtocolContext`).
+- **Training**: Rule-based symbolic compiler (zero learned weights), verified by deterministic codegen checks and pytest suites (`40` tests on `main`; `73` tests with full liquid-conservation and YAML `2.10` type guards on `origin/review-fixes`).
+- **History**: `4534ff1` (2026-11-18, `main` v0.1.0 compiler, mock/Opentrons checker, CLI, examples, and CI) -> `ef6865f` (2026-11-18, `origin/review-fixes` deterministic `apiLevel`, `liquids` & well-volume tracking, multichannel/alias guards, and expanded tests).
+- **Unique Properties**: Byte-reproducible code generation, compile-time tip-budget and liquid-volume conservation before hardware touch, and direct `L1` integration with [`twinstep`](https://github.com/yaniguan/twinstep), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), and [`lab-hands`](https://github.com/yaniguan/lab-hands).
+
+Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
+
+## Repository Layout
+
+```text
+stepbot/
+├── .github/workflows/ci.yml      # Python 3.11/3.12 CI matrix (mock + Opentrons simulator)
+├── docs/
+│   └── ARCHITECTURE_AND_HISTORY.md
+├── examples/
+│   ├── dilution_series.yaml      # 8-well 2-fold serial dilution example
+│   ├── plate_fill.yaml           # Multi-reagent distribute, transfer, and mix example
+│   ├── reservoir_mix.yaml        # Dual-pipette (p300 + p20) 24-well example
+│   └── out/                      # Deterministically compiled Opentrons Python API v2 scripts
+├── pyproject.toml                # Package metadata, CLI entrypoint, and [sim,dev] extras
+├── src/stepbot/
+│   ├── catalog.py                # 24 standard labware specs, 12 pipette specs, API version helpers
+│   ├── checker.py                # opentrons.simulate wrapper + zero-dependency MockProtocolContext
+│   ├── cli.py                    # `stepbot compile` and `stepbot check` CLI
+│   ├── codegen.py                # Slot- and mount-sorted Python API v2 source emitter
+│   ├── compiler.py               # Schema validator, macro lowerer, tip & volume state trackers
+│   ├── models.py                 # Frozen IR dataclasses and ValidationError
+│   └── wells.py                  # Well coordinate parser, rectangular range & serial expanders
+└── tests/                        # CLI, compiler, example-determinism, and validation test suites
+```
+
 ## Quickstart
 
 Compile a protocol from YAML or JSON:
