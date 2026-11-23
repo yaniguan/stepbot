@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import json
 import keyword
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from stepbot.catalog import get_labware_spec, get_pipette_spec, select_api_level
+from stepbot.catalog import (
+    DEFAULT_API_LEVEL,
+    get_labware_spec,
+    get_pipette_spec,
+    parse_api_level,
+)
 from stepbot.codegen import render_protocol
 from stepbot.models import (
     CommentStep,
@@ -18,6 +24,7 @@ from stepbot.models import (
     DiscardStep,
     DistributeStep,
     DropTipStep,
+    LiquidSpec,
     LoweredStep,
     MixStep,
     PauseStep,
@@ -30,8 +37,13 @@ from stepbot.models import (
 )
 from stepbot.wells import resolve_serial_wells, resolve_well_refs
 
-_RESERVED_NAMES = {"protocol", "metadata"}
+# Names used by the generated code itself; deck aliases must not shadow them.
+_RESERVED_NAMES = {"protocol", "metadata", "liquids", "pipette_left", "pipette_right"}
 _VALID_NEW_TIP = {"once", "always", "never"}
+_API_LEVEL_RE = re.compile(r"^\d+\.\d+$")
+# Well.load_liquid and ProtocolContext.define_liquid need API level 2.14 or newer.
+_MIN_LIQUID_API_LEVEL = (2, 14)
+_VOLUME_TOLERANCE = 1e-6
 
 
 def load_protocol_data(path: Path | str) -> dict[str, Any]:
@@ -107,6 +119,11 @@ def _parse_pipettes(raw_pipettes: Any, deck: dict[str, DeckItem]) -> dict[str, P
         spec = get_pipette_spec(model)
         if spec is None:
             raise ValidationError(f"Unknown Opentrons pipette model '{model}' on mount '{mount}'")
+        if spec.channels > 1:
+            raise ValidationError(
+                f"Multichannel pipette '{model}' on mount '{mount}' is not supported yet: "
+                "tip counting and well targeting assume a single-channel pipette"
+            )
         tip_racks = entry.get("tip_racks")
         if not isinstance(tip_racks, list) or not tip_racks:
             raise ValidationError(f"Pipette '{mount}' must define a non-empty 'tip_racks' list")
@@ -129,6 +146,65 @@ def _parse_pipettes(raw_pipettes: Any, deck: dict[str, DeckItem]) -> dict[str, P
             spec=spec,
         )
     return pipettes
+
+
+def _parse_api_level(raw: Any) -> str:
+    if raw is None:
+        return DEFAULT_API_LEVEL
+    if not isinstance(raw, str):
+        raise ValidationError(
+            f"metadata.apiLevel must be a quoted string such as \"{DEFAULT_API_LEVEL}\", "
+            f"got {raw!r} ({type(raw).__name__}); unquoted YAML numbers drop trailing "
+            "zeros, so 2.10 is read as 2.1"
+        )
+    level = raw.strip()
+    if not _API_LEVEL_RE.match(level):
+        raise ValidationError(
+            f"metadata.apiLevel '{raw}' must look like '<major>.<minor>', e.g. \"{DEFAULT_API_LEVEL}\""
+        )
+    major, minor = parse_api_level(level)
+    if f"{major}.{minor}" != level:
+        raise ValidationError(f"metadata.apiLevel '{raw}' must not have leading zeros")
+    if major != 2:
+        raise ValidationError(
+            f"metadata.apiLevel '{raw}' is not supported: only Opentrons Python API v2 (2.x) is targeted"
+        )
+    return level
+
+
+def _parse_liquids(raw_liquids: Any, deck: dict[str, DeckItem]) -> tuple[LiquidSpec, ...]:
+    if raw_liquids is None:
+        return ()
+    if not isinstance(raw_liquids, dict):
+        raise ValidationError("'liquids' must be a mapping of name -> {wells, volume}")
+    liquids: list[LiquidSpec] = []
+    owner: dict[WellRef, str] = {}
+    for name, entry in raw_liquids.items():
+        if not isinstance(name, str) or not name:
+            raise ValidationError(f"Liquid name {name!r} must be a non-empty string")
+        if not isinstance(entry, dict):
+            raise ValidationError(f"Liquid '{name}' must be a mapping with 'wells' and 'volume'")
+        raw_wells = entry.get("wells", entry.get("well"))
+        if raw_wells is None:
+            raise ValidationError(f"Liquid '{name}' requires 'wells'")
+        wells = resolve_well_refs(raw_wells, deck)
+        volume = entry.get("volume")
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume <= 0:
+            raise ValidationError(f"Liquid '{name}' volume must be a positive number, got {volume!r}")
+        vol = float(volume)
+        for ref in wells:
+            if ref in owner:
+                raise ValidationError(
+                    f"Well '{ref.labware}:{ref.well}' is assigned to both liquid "
+                    f"'{owner[ref]}' and '{name}'"
+                )
+            owner[ref] = name
+        _check_well_capacity(wells, vol, deck, f"Liquid '{name}'")
+        description = entry.get("description", "")
+        liquids.append(
+            LiquidSpec(name=name, description=str(description), wells=tuple(wells), volume=vol)
+        )
+    return tuple(liquids)
 
 
 def _select_pipette(params: dict[str, Any], pipettes: dict[str, PipetteConfig]) -> PipetteConfig:
@@ -231,6 +307,74 @@ class _TipStateTracker:
             self.consume_tips(mount, 1)
             out.append(PickUpTipStep(pipette=mount))
             self.has_tip[mount] = True
+
+
+def _fmt_ul(volume: float) -> str:
+    return f"{round(volume, 4):g}"
+
+
+def _well_label(ref: WellRef) -> str:
+    return f"'{ref.labware}:{ref.well}'"
+
+
+class _WellVolumeTracker:
+    """Track the liquid volume in every well and reject overfills or over-aspiration."""
+
+    def __init__(self, deck: dict[str, DeckItem], liquids: tuple[LiquidSpec, ...]) -> None:
+        self.deck = deck
+        self.volumes: dict[WellRef, float] = {}
+        for liquid in liquids:
+            for ref in liquid.wells:
+                self.volumes[ref] = liquid.volume
+
+    def remove(self, ref: WellRef, volume: float, label: str) -> None:
+        current = self.volumes.get(ref, 0.0)
+        if volume > current + _VOLUME_TOLERANCE:
+            raise ValidationError(
+                f"{label}: aspirating {_fmt_ul(volume)} uL from {_well_label(ref)}, which holds "
+                f"only {_fmt_ul(current)} uL (declare starting volumes under 'liquids')"
+            )
+        self.volumes[ref] = max(0.0, current - volume)
+
+    def add(self, ref: WellRef, volume: float, label: str) -> None:
+        new_volume = self.volumes.get(ref, 0.0) + volume
+        max_vol = self.deck[ref.labware].spec.max_volume
+        if new_volume > max_vol + _VOLUME_TOLERANCE:
+            raise ValidationError(
+                f"{label}: dispensing {_fmt_ul(volume)} uL brings {_well_label(ref)} to "
+                f"{_fmt_ul(new_volume)} uL, which exceeds well capacity {_fmt_ul(max_vol)} uL"
+            )
+        self.volumes[ref] = new_volume
+
+    def check_mix(self, ref: WellRef, volume: float, label: str) -> None:
+        current = self.volumes.get(ref, 0.0)
+        if volume > current + _VOLUME_TOLERANCE:
+            raise ValidationError(
+                f"{label}: mix volume {_fmt_ul(volume)} uL is more than the "
+                f"{_fmt_ul(current)} uL in {_well_label(ref)}"
+            )
+
+    def apply(self, step: LoweredStep, label: str) -> None:
+        if isinstance(step, TransferStep):
+            srcs, dsts = list(step.src), list(step.dst)
+            if len(srcs) == 1:
+                srcs = srcs * len(dsts)
+            elif len(dsts) == 1:
+                dsts = dsts * len(srcs)
+            for src, dst in zip(srcs, dsts):
+                self.remove(src, step.volume, label)
+                self.add(dst, step.volume, label)
+                if step.mix_after is not None:
+                    self.check_mix(dst, step.mix_after[1], label)
+        elif isinstance(step, DistributeStep):
+            self.remove(step.src, step.volume * len(step.dst), label)
+            for dst in step.dst:
+                self.add(dst, step.volume, label)
+        elif isinstance(step, MixStep):
+            for well in step.wells:
+                self.check_mix(well, step.volume, label)
+        elif isinstance(step, DiscardStep):
+            self.remove(step.src, step.volume, label)
 
 
 def _lower_transfer(
@@ -461,20 +605,28 @@ def parse_and_validate(data: dict[str, Any]) -> ProtocolSpec:
         raise ValidationError("'metadata' must be a mapping")
     name = str(metadata.get("name", "Stepbot Protocol"))
     description = str(metadata.get("description", ""))
-    api_level = str(metadata.get("apiLevel") or select_api_level())
+    api_level = _parse_api_level(metadata.get("apiLevel"))
 
     deck = _parse_deck(data.get("deck"))
     pipettes = _parse_pipettes(data.get("pipettes"), deck)
+    liquids = _parse_liquids(data.get("liquids"), deck)
+    if liquids and parse_api_level(api_level) < _MIN_LIQUID_API_LEVEL:
+        raise ValidationError(
+            f"'liquids' requires apiLevel {_MIN_LIQUID_API_LEVEL[0]}.{_MIN_LIQUID_API_LEVEL[1]} "
+            f"or newer, got '{api_level}'"
+        )
 
     raw_steps = data.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ValidationError("'steps' must be a non-empty list")
 
     tracker = _TipStateTracker(deck, pipettes)
+    volumes = _WellVolumeTracker(deck, liquids)
     lowered: list[LoweredStep] = []
 
     for idx, raw_step in enumerate(raw_steps, start=1):
         kind, params = _extract_step(raw_step, idx)
+        first_new = len(lowered)
         if kind == "comment":
             text = params.get("text", params.get("message", ""))
             lowered.append(CommentStep(text=str(text)))
@@ -502,6 +654,8 @@ def parse_and_validate(data: dict[str, Any]) -> ProtocolSpec:
             _lower_dilution_series(params, deck, pipettes, tracker, lowered)
         else:
             raise ValidationError(f"Unsupported step type '{kind}' at step {idx}")
+        for step in lowered[first_new:]:
+            volumes.apply(step, f"Step {idx} ({kind})")
 
     for mount in sorted(pipettes):
         tracker.ensure_no_tip(mount, lowered)
@@ -513,6 +667,7 @@ def parse_and_validate(data: dict[str, Any]) -> ProtocolSpec:
         deck=deck,
         pipettes=pipettes,
         steps=lowered,
+        liquids=liquids,
     )
 
 

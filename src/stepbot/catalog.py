@@ -133,14 +133,16 @@ def get_pipette_spec(model: str) -> PipetteSpec | None:
     return PIPETTE_CATALOG.get(model)
 
 
-def select_api_level() -> str:
-    """Pick a supported Opentrons Python API v2 level."""
+def parse_api_level(api_level: str) -> tuple[int, int]:
+    """Split an 'X.Y' API level string into an integer (major, minor) tuple."""
+    major, minor = api_level.split(".")
+    return int(major), int(minor)
+
+
+def installed_max_api_level() -> tuple[int, int] | None:
+    """Return the highest API level the installed opentrons supports, or None."""
     try:
         from opentrons.protocol_api import MAX_SUPPORTED_VERSION
     except ImportError:
-        return DEFAULT_API_LEVEL
-    major, minor = DEFAULT_API_LEVEL.split(".")
-    target = (int(major), int(minor))
-    max_ver = (MAX_SUPPORTED_VERSION.major, MAX_SUPPORTED_VERSION.minor)
-    chosen = min(target, max_ver)
-    return f"{chosen[0]}.{chosen[1]}"
+        return None
+    return MAX_SUPPORTED_VERSION.major, MAX_SUPPORTED_VERSION.minor

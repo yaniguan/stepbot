@@ -19,6 +19,14 @@ pipettes:
     tip_racks:
       - tips
 
+liquids:
+  dye:
+    wells: reservoir:A1
+    volume: 2000
+  buffer:
+    wells: reservoir:A2
+    volume: 5000
+
 steps:
   - comment: Prepare 2-fold dye dilution series across row A
   - dilution_series:

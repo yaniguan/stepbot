@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import copy
+import sys
+import types
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
-from stepbot.compiler import compile_protocol
+from stepbot.catalog import DEFAULT_API_LEVEL
+from stepbot.compiler import compile_protocol, load_protocol_data
 from stepbot.models import ValidationError
 
 
@@ -21,6 +26,10 @@ def _base_protocol() -> dict[str, Any]:
         },
         "pipettes": {
             "left": {"model": "p300_single_gen2", "tip_racks": ["tips"]},
+        },
+        "liquids": {
+            "stock": {"wells": "reservoir:A1", "volume": 10000},
+            "diluent": {"wells": "reservoir:A2", "volume": 10000},
         },
         "steps": [
             {
@@ -88,7 +97,8 @@ def test_out_of_range_volume_rejected(bad_volume: Any) -> None:
 
 def test_dilution_series_out_of_pipette_range_rejected() -> None:
     data = _base_protocol()
-    # factor=2, final_volume=200 -> initial_volume=400 (>300 uL pipette max & >360 uL well max)
+    # factor=2, final_volume=200 -> initial_volume=400 (>300 uL pipette max); the pipette
+    # range check fires first, so well capacity is covered by the next test.
     data["steps"] = [
         {
             "dilution_series": {
@@ -153,3 +163,168 @@ def test_non_tiprack_in_tip_racks_rejected() -> None:
     data["pipettes"]["left"]["tip_racks"] = ["plate"]
     with pytest.raises(ValidationError, match="not a tip rack"):
         compile_protocol(data)
+
+
+def test_dilution_series_exceeding_well_capacity_rejected() -> None:
+    data = _base_protocol()
+    data["deck"]["plate"]["labware"] = "nest_96_wellplate_100ul_pcr_full_skirt"
+    # factor=2, final_volume=60 -> initial_volume=120: inside the p300 range, above the 100 uL well.
+    data["steps"] = [
+        {
+            "dilution_series": {
+                "source": "reservoir:A1",
+                "diluent": "reservoir:A2",
+                "first_well": "plate:A1",
+                "n": 4,
+                "factor": 2,
+                "final_volume": 60,
+            }
+        }
+    ]
+    with pytest.raises(ValidationError, match="exceeds well capacity"):
+        compile_protocol(data)
+
+
+def test_repeated_transfers_overfilling_well_rejected() -> None:
+    data = _base_protocol()
+    data["deck"]["plate"]["labware"] = "nest_96_wellplate_100ul_pcr_full_skirt"
+    data["steps"] = [
+        {"transfer": {"src": "reservoir:A1", "dst": "plate:A1", "volume": 80}},
+        {"transfer": {"src": "reservoir:A1", "dst": "plate:A1", "volume": 80}},
+    ]
+    with pytest.raises(ValidationError, match=r"Step 2 \(transfer\).*exceeds well capacity"):
+        compile_protocol(data)
+
+
+def test_distribute_overfilling_well_rejected() -> None:
+    data = _base_protocol()
+    data["deck"]["plate"]["labware"] = "nest_96_wellplate_100ul_pcr_full_skirt"
+    data["steps"] = [
+        {"distribute": {"src": "reservoir:A1", "dst": ["plate:A1", "plate:A2"], "volume": 150}},
+    ]
+    with pytest.raises(ValidationError, match="exceeds well capacity"):
+        compile_protocol(data)
+
+
+def test_mix_larger_than_well_contents_rejected() -> None:
+    data = _base_protocol()
+    data["steps"] = [
+        {"transfer": {"src": "reservoir:A1", "dst": "plate:A1", "volume": 50}},
+        {"mix": {"well": "plate:A1", "volume": 250, "reps": 2}},
+    ]
+    with pytest.raises(ValidationError, match="mix volume 250 uL is more than the 50 uL"):
+        compile_protocol(data)
+
+
+def test_transfer_mix_after_larger_than_well_contents_rejected() -> None:
+    data = _base_protocol()
+    data["steps"] = [
+        {
+            "transfer": {
+                "src": "reservoir:A1",
+                "dst": "plate:A1",
+                "volume": 50,
+                "mix_after": {"reps": 2, "volume": 100},
+            }
+        },
+    ]
+    with pytest.raises(ValidationError, match="mix volume"):
+        compile_protocol(data)
+
+
+def test_aspirating_from_undeclared_well_rejected() -> None:
+    data = _base_protocol()
+    data["steps"] = [
+        {"transfer": {"src": "reservoir:A3", "dst": "plate:A1", "volume": 50}},
+    ]
+    with pytest.raises(ValidationError, match="holds only 0 uL"):
+        compile_protocol(data)
+
+
+def test_source_running_dry_rejected() -> None:
+    data = _base_protocol()
+    data["liquids"]["stock"]["volume"] = 150
+    data["steps"] = [
+        {"distribute": {"src": "reservoir:A1", "dst": "plate:A1-A2", "volume": 100}},
+    ]
+    with pytest.raises(ValidationError, match="aspirating 200 uL.*holds only 150 uL"):
+        compile_protocol(data)
+
+
+def test_liquid_volume_above_well_capacity_rejected() -> None:
+    data = _base_protocol()
+    data["liquids"]["stock"] = {"wells": "plate:A1", "volume": 400}
+    with pytest.raises(ValidationError, match="exceeds well capacity"):
+        compile_protocol(data)
+
+
+def test_liquid_wells_overlapping_rejected() -> None:
+    data = _base_protocol()
+    data["liquids"]["diluent"]["wells"] = "reservoir:A1"
+    with pytest.raises(ValidationError, match="assigned to both liquid"):
+        compile_protocol(data)
+
+
+def test_liquids_require_api_level_2_14() -> None:
+    data = _base_protocol()
+    data["metadata"]["apiLevel"] = "2.13"
+    with pytest.raises(ValidationError, match="requires apiLevel 2.14"):
+        compile_protocol(data)
+
+
+@pytest.mark.parametrize("alias", ["pipette_left", "pipette_right", "liquids", "protocol"])
+def test_reserved_deck_alias_rejected(alias: str) -> None:
+    data = _base_protocol()
+    data["deck"][alias] = data["deck"].pop("plate")
+    with pytest.raises(ValidationError, match="reserved"):
+        compile_protocol(data)
+
+
+def test_multichannel_pipette_rejected() -> None:
+    data = _base_protocol()
+    data["pipettes"]["left"]["model"] = "p300_multi_gen2"
+    with pytest.raises(ValidationError, match="Multichannel pipette 'p300_multi_gen2'"):
+        compile_protocol(data)
+
+
+@pytest.mark.parametrize("bad_level", [2.1, 2, True])
+def test_non_string_api_level_rejected(bad_level: Any) -> None:
+    data = _base_protocol()
+    data["metadata"]["apiLevel"] = bad_level
+    with pytest.raises(ValidationError, match="must be a quoted string"):
+        compile_protocol(data)
+
+
+@pytest.mark.parametrize("bad_level", ["banana", "2", "2.16.1", "", "3.0", "2.016"])
+def test_malformed_api_level_rejected(bad_level: str) -> None:
+    data = _base_protocol()
+    data["metadata"]["apiLevel"] = bad_level
+    with pytest.raises(ValidationError, match="apiLevel"):
+        compile_protocol(data)
+
+
+def test_unquoted_yaml_api_level_rejected(tmp_path: Path) -> None:
+    data = _base_protocol()
+    data["metadata"]["apiLevel"] = "LEVEL"
+    text = yaml.safe_dump(data).replace("apiLevel: LEVEL", "apiLevel: 2.10")
+    yaml_path = tmp_path / "proto.yaml"
+    yaml_path.write_text(text, encoding="utf-8")
+    loaded = load_protocol_data(yaml_path)
+    assert loaded["metadata"]["apiLevel"] == 2.1
+    with pytest.raises(ValidationError, match="2.10 is read as 2.1"):
+        compile_protocol(loaded)
+
+
+def test_quoted_api_level_kept_verbatim() -> None:
+    data = _base_protocol()
+    data["metadata"]["apiLevel"] = "2.20"
+    assert "\"apiLevel\": '2.20'" in compile_protocol(data)
+
+
+def test_default_api_level_ignores_installed_opentrons(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_api = types.ModuleType("opentrons.protocol_api")
+    fake_api.MAX_SUPPORTED_VERSION = types.SimpleNamespace(major=2, minor=15)
+    monkeypatch.setitem(sys.modules, "opentrons", types.ModuleType("opentrons"))
+    monkeypatch.setitem(sys.modules, "opentrons.protocol_api", fake_api)
+    source = compile_protocol(_base_protocol())
+    assert f"\"apiLevel\": '{DEFAULT_API_LEVEL}'" in source

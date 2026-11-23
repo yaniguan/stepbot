@@ -12,6 +12,15 @@ def run(protocol):
 
     pipette_left = protocol.load_instrument('p300_single_gen2', 'left', tip_racks=[tips])
 
+    liquids = {
+        'buffer': protocol.define_liquid('buffer', description='', display_color=None),
+        'dye': protocol.define_liquid('dye', description='', display_color=None),
+        'water': protocol.define_liquid('water', description='', display_color=None),
+    }
+    reservoir["A1"].load_liquid(liquid=liquids['buffer'], volume=5000)
+    reservoir["A2"].load_liquid(liquid=liquids['dye'], volume=2000)
+    reservoir["A3"].load_liquid(liquid=liquids['water'], volume=2000)
+
     protocol.comment('Distribute buffer into row A wells A1-A8')
     pipette_left.distribute(150, reservoir["A1"], [plate["A1"], plate["A2"], plate["A3"], plate["A4"], plate["A5"], plate["A6"], plate["A7"], plate["A8"]], new_tip='once')
     protocol.comment('Add dye to A1-A4 and water blanks to A5-A8')
