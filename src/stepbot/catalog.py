@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from stepbot.models import LabwareSpec, PipetteSpec
+from stepbot.models import DeckSlot, LabwareSpec, PipetteSpec
 
 
 def row_index_to_label(row: int) -> str:
@@ -97,6 +98,12 @@ LABWARE_CATALOG: dict[str, LabwareSpec] = {
         _grid_spec("opentrons_96_filtertiprack_200ul", 8, 12, 200.0, is_tiprack=True),
         _grid_spec("opentrons_96_filtertiprack_20ul", 8, 12, 20.0, is_tiprack=True),
         _grid_spec("opentrons_96_filtertiprack_1000ul", 8, 12, 1000.0, is_tiprack=True),
+        _grid_spec("opentrons_flex_96_tiprack_50ul", 8, 12, 50.0, is_tiprack=True),
+        _grid_spec("opentrons_flex_96_tiprack_200ul", 8, 12, 200.0, is_tiprack=True),
+        _grid_spec("opentrons_flex_96_tiprack_1000ul", 8, 12, 1000.0, is_tiprack=True),
+        _grid_spec("opentrons_flex_96_filtertiprack_50ul", 8, 12, 50.0, is_tiprack=True),
+        _grid_spec("opentrons_flex_96_filtertiprack_200ul", 8, 12, 200.0, is_tiprack=True),
+        _grid_spec("opentrons_flex_96_filtertiprack_1000ul", 8, 12, 1000.0, is_tiprack=True),
     ]
 }
 
@@ -116,18 +123,72 @@ PIPETTE_CATALOG: dict[str, PipetteSpec] = {
         PipetteSpec("p300_multi_gen2", 20.0, 300.0, 8),
         PipetteSpec("p1000_single", 100.0, 1000.0, 1),
         PipetteSpec("p1000_single_gen2", 100.0, 1000.0, 1),
+        PipetteSpec("flex_1channel_50", 1.0, 50.0, 1),
+        PipetteSpec("flex_1channel_1000", 5.0, 1000.0, 1),
+        PipetteSpec("flex_8channel_50", 1.0, 50.0, 8),
+        PipetteSpec("flex_8channel_1000", 5.0, 1000.0, 8),
     ]
 }
 
 
 DEFAULT_API_LEVEL = "2.16"
+FLEX_DEFAULT_API_LEVEL = "2.18"
+DEFAULT_FLEX_TRASH_SLOT = "A3"
+
+FLEX_WORKING_SLOTS: frozenset[str] = frozenset(
+    f"{row}{col}" for row in ("A", "B", "C", "D") for col in (1, 2, 3)
+)
+FLEX_STAGING_SLOTS: frozenset[str] = frozenset(
+    f"{row}4" for row in ("A", "B", "C", "D")
+)
+FLEX_ALL_SLOTS: frozenset[str] = FLEX_WORKING_SLOTS | FLEX_STAGING_SLOTS
+
+_FLEX_SLOT_RE = re.compile(r"^([A-D])([1-4])$")
+
+
+def is_flex_pipette(model: str) -> bool:
+    """Return True if a pipette model belongs to the Opentrons Flex instrument family."""
+    return model.startswith("flex_")
+
+
+def is_flex_tiprack(load_name: str) -> bool:
+    """Return True if a tip-rack load name belongs to the Opentrons Flex tip family."""
+    return load_name.startswith("opentrons_flex_")
+
+
+def is_valid_flex_slot(slot: Any, *, allow_staging: bool = True) -> bool:
+    """Return True if `slot` is a canonical Opentrons Flex deck coordinate ('A1'..'D3' or 'A4'..'D4')."""
+    if not isinstance(slot, str):
+        return False
+    allowed = FLEX_ALL_SLOTS if allow_staging else FLEX_WORKING_SLOTS
+    return slot in allowed
+
+
+def deck_slot_sort_key(slot: DeckSlot) -> tuple[int, int, int, str]:
+    """Deterministic sort key ordering OT-2 integer slots (1..11) then Flex coordinates (A1..D4)."""
+    if isinstance(slot, int) and not isinstance(slot, bool):
+        return (0, slot, 0, "")
+    s = str(slot)
+    match = _FLEX_SLOT_RE.match(s)
+    if match:
+        row_ch, col_s = match.groups()
+        return (1, ord(row_ch) - ord("A"), int(col_s), s)
+    return (2, 0, 0, s)
 
 
 def is_tip_rack_compatible(pip_spec: PipetteSpec, rack_spec: LabwareSpec) -> bool:
     """Return True if a tip rack's nozzle/volume family matches the pipette."""
     if not rack_spec.is_tiprack:
         return False
+    pip_flex = is_flex_pipette(pip_spec.model)
+    rack_flex = is_flex_tiprack(rack_spec.load_name)
+    if pip_flex != rack_flex:
+        return False
     tip_vol = rack_spec.max_volume
+    if pip_flex:
+        if pip_spec.max_volume <= 50.0:
+            return abs(tip_vol - 50.0) <= 1e-6
+        return 50.0 <= tip_vol <= 1000.0
     if pip_spec.max_volume <= 20.0:
         return 1.0 <= tip_vol <= 20.0
     if pip_spec.max_volume <= 300.0:
@@ -137,6 +198,10 @@ def is_tip_rack_compatible(pip_spec: PipetteSpec, rack_spec: LabwareSpec) -> boo
 
 def expected_tip_family_description(pip_spec: PipetteSpec) -> str:
     """Return human-readable compatible tip-rack volume range for error diagnostics."""
+    if is_flex_pipette(pip_spec.model):
+        if pip_spec.max_volume <= 50.0:
+            return "Opentrons Flex 50 uL"
+        return "Opentrons Flex 50-1000 uL"
     if pip_spec.max_volume <= 20.0:
         return "10-20 uL"
     if pip_spec.max_volume <= 300.0:

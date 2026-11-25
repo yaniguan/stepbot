@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
+import contextlib
 import json
 import os
-import sys
-from collections.abc import Sequence
 from pathlib import Path
+import sys
 
 from stepbot.checker import check_protocol
 from stepbot.compiler import compile_file
 from stepbot.mcp_runtime import (
+    DEFAULT_MAX_CONSUMED_NONCES,
     DEFAULT_MCP_SECRET_KEY,
     DEFAULT_MCP_TOOL_NAME,
     McpSecurityViolation,
+    OpentronsHttpRunAdapter,
     StepbotMcpExecutor,
     compile_with_mcp_envelope,
+    load_mcp_state,
+    mcp_state_lock,
+    save_mcp_state_atomic,
 )
 from stepbot.models import ValidationError
 
@@ -100,7 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     mcp_dispatch_cmd = sub.add_parser(
         "mcp-dispatch",
-        help="Verify a lean-mcp/v1 envelope and dispatch compiled Python protocol to simulator.",
+        help="Verify a lean-mcp/v1 envelope and dispatch compiled Python protocol to simulator or robot.",
     )
     mcp_dispatch_cmd.add_argument(
         "protocol", type=Path, help="Path to compiled Opentrons Python protocol."
@@ -124,10 +130,45 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional JSON state file persisting current_deck_epoch and consumed_nonces.",
     )
     mcp_dispatch_cmd.add_argument(
+        "--max-nonces",
+        type=int,
+        default=DEFAULT_MAX_CONSUMED_NONCES,
+        help=f"Maximum FIFO-retained consumed_nonces entries (default: {DEFAULT_MAX_CONSUMED_NONCES}).",
+    )
+    mcp_dispatch_cmd.add_argument(
         "--secret-key",
         type=str,
         default=None,
         help="Shared HMAC secret key (defaults to LEAN_MCP_SECRET_KEY or dev key).",
+    )
+    mcp_dispatch_cmd.add_argument(
+        "--robot-url",
+        type=str,
+        default=None,
+        help="Optional Opentrons Robot Server HTTP API v2 base URL (e.g. http://192.168.50.10:31950; hardware-optional).",
+    )
+    mcp_dispatch_cmd.add_argument(
+        "--run-timeout",
+        type=float,
+        default=300.0,
+        help="Maximum physical run duration in seconds when --robot-url is set (default: 300.0).",
+    )
+    mcp_dispatch_cmd.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        help="Polling interval in seconds for Opentrons /runs/{id} status (default: 0.5).",
+    )
+    mcp_dispatch_cmd.add_argument(
+        "--clear-taint",
+        action="store_true",
+        help="Clear prior deck_tainted lock in --state (requires --supervisor-id).",
+    )
+    mcp_dispatch_cmd.add_argument(
+        "--supervisor-id",
+        type=str,
+        default="",
+        help="Supervisor identifier authorizing --clear-taint recovery.",
     )
     mcp_dispatch_cmd.add_argument(
         "--mock", action="store_true", help="Force the built-in safe AST mock simulator."
@@ -223,46 +264,81 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "mcp-dispatch":
         secret = args.secret_key or os.environ.get("LEAN_MCP_SECRET_KEY", DEFAULT_MCP_SECRET_KEY)
+        state_path: Path | None = args.state
         try:
             python_code = args.protocol.read_text(encoding="utf-8")
             raw_env = json.loads(args.envelope.read_text(encoding="utf-8"))
             if not isinstance(raw_env, dict):
                 raise McpSecurityViolation("mcp_schema", "Envelope JSON root must be an object")
 
-            deck_epoch: int = int(args.epoch)
-            consumed: list[str] = []
-            if args.state is not None and args.state.exists():
-                state_data = json.loads(args.state.read_text(encoding="utf-8"))
-                if isinstance(state_data, dict):
-                    raw_ep = state_data.get("current_deck_epoch", deck_epoch)
-                    if isinstance(raw_ep, int) and not isinstance(raw_ep, bool):
-                        deck_epoch = raw_ep
-                    raw_nonces = state_data.get("consumed_nonces", [])
-                    if isinstance(raw_nonces, list):
-                        consumed = [str(n) for n in raw_nonces]
-
-            executor = StepbotMcpExecutor(
-                secret_key=secret,
-                current_deck_epoch=deck_epoch,
-                consumed_nonces=consumed,
-                use_mock=bool(args.mock),
-            )
-            receipt = executor.dispatch(python_code, raw_env, simulate=True)
-            if args.state is not None:
-                args.state.parent.mkdir(parents=True, exist_ok=True)
-                args.state.write_text(
-                    json.dumps(
-                        {
-                            "current_deck_epoch": executor.current_deck_epoch,
-                            "consumed_nonces": sorted(executor.consumed_nonces),
-                        },
-                        indent=2,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                    newline="\n",
+            hw_adapter = (
+                OpentronsHttpRunAdapter(
+                    str(args.robot_url),
+                    timeout_s=float(args.run_timeout),
+                    poll_interval_s=float(args.poll_interval),
                 )
-        except (McpSecurityViolation, json.JSONDecodeError, ValueError, OSError) as exc:
+                if args.robot_url is not None
+                else None
+            )
+
+            lock_ctx: contextlib.AbstractContextManager[None] = (
+                mcp_state_lock(state_path)
+                if state_path is not None
+                else contextlib.nullcontext()
+            )
+            with lock_ctx:
+                deck_epoch: int = int(args.epoch)
+                consumed: Sequence[str] = ()
+                deck_tainted = False
+                taint_reason: str | None = None
+                if state_path is not None and state_path.exists():
+                    loaded_state = load_mcp_state(state_path)
+                    deck_epoch = loaded_state.current_deck_epoch
+                    consumed = loaded_state.consumed_nonces
+                    deck_tainted = loaded_state.deck_tainted
+                    taint_reason = loaded_state.taint_reason
+
+                executor = StepbotMcpExecutor(
+                    secret_key=secret,
+                    current_deck_epoch=deck_epoch,
+                    consumed_nonces=consumed,
+                    use_mock=bool(args.mock),
+                    max_consumed_nonces=int(args.max_nonces),
+                    hardware_adapter=hw_adapter,
+                    deck_tainted=deck_tainted,
+                    taint_reason=taint_reason,
+                )
+                if args.clear_taint:
+                    executor.clear_deck_taint(supervisor_id=str(args.supervisor_id))
+
+                def _persist_current_state() -> None:
+                    if state_path is not None:
+                        save_mcp_state_atomic(
+                            state_path,
+                            current_deck_epoch=executor.current_deck_epoch,
+                            consumed_nonces=executor.consumed_nonces,
+                            deck_tainted=executor.deck_tainted,
+                            taint_reason=executor.taint_reason,
+                        )
+
+                try:
+                    receipt = executor.dispatch(
+                        python_code,
+                        raw_env,
+                        simulate=True,
+                        on_pre_play_commit=_persist_current_state,
+                    )
+                except McpSecurityViolation:
+                    # Persist post-play taint / pre-committed nonce & epoch if hardware faulted
+                    if state_path is not None and (
+                        executor.deck_tainted != deck_tainted
+                        or executor.current_deck_epoch != deck_epoch
+                    ):
+                        _persist_current_state()
+                    raise
+
+                _persist_current_state()
+        except (McpSecurityViolation, json.JSONDecodeError, ValueError, OSError, UnicodeDecodeError) as exc:
             if args.json:
                 rule = exc.rule if isinstance(exc, McpSecurityViolation) else "mcp_io_or_parse"
                 print(json.dumps({"ok": False, "rule": rule, "error": str(exc)}, indent=2))
