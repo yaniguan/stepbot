@@ -7,9 +7,20 @@ from typing import Any
 
 VOLUME_TOLERANCE = 1e-6
 
+DeckSlot = int | str
+
 
 class ValidationError(ValueError):
     """Raised when a protocol specification fails validation."""
+
+
+class McpSecurityViolation(RuntimeError):
+    """Default-deny exception raised when a Lean-MCP hardware dispatch fails verification."""
+
+    def __init__(self, rule: str, message: str) -> None:
+        super().__init__(f"[{rule}] {message}")
+        self.rule = rule
+        self.reason = message
 
 
 @dataclass(frozen=True)
@@ -40,11 +51,11 @@ class PipetteSpec:
 
 @dataclass(frozen=True)
 class DeckItem:
-    """A labware placed on a deck slot."""
+    """A labware placed on a deck slot (OT-2 integer 1..11 or Flex coordinate 'A1'..'D4')."""
 
     alias: str
     load_name: str
-    slot: int
+    slot: DeckSlot
     spec: LabwareSpec
 
 
@@ -219,6 +230,8 @@ class ProtocolSpec:
     tips_used_per_mount: dict[str, int] = field(default_factory=dict)
     well_summaries: dict[str, WellSummary] = field(default_factory=dict)
     step_origins: tuple[StepOrigin, ...] = ()
+    robot_type: str = "OT-2"
+    trash_slot: str | None = None
 
     def to_manifest_meta(self) -> dict[str, Any]:
         """Return static analysis summary fields for JSON manifest emission."""

@@ -20,12 +20,12 @@ pip install -e ".[sim,dev]"
 
 `stepbot` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L1 · Protocol Compiler & Visuo-Tactile Manipulation`**.
 
-- **Object**: Deterministic liquid-handling compiler and dual-backend verifier translating declarative YAML/JSON protocols into idiomatic Opentrons Python API v2 scripts (`apiLevel` `2.16`) plus optional JSON manifests (`--manifest`).
-- **Data**: Strictly validated protocol schema (`metadata`, `deck`, `pipettes`, optional `liquids`, and `steps`), built-in catalog of `24` Opentrons labware definitions (including heterogeneous 4x50 mL + 6x15 mL Falcon racks) and `12` Gen1/Gen2 pipettes, `twinstep` protocol importer (`stepbot.interop.from_twinstep`), and `3` end-to-end YAML/Python example pairs.
-- **Model**: Four-stage pipeline (`wells.py` 2D row/column grid & range resolver -> `compiler.py` strict schema validator, macro lowerer, `_TipStateTracker` automaton, and `_WellVolumeTracker` with `distribute` disposal-volume & reagent-lineage tracking -> `codegen.py` slot/mount-sorted Python & manifest emitter -> `checker.py` `opentrons.simulate` + execution-safe AST `MockProtocolContext`).
+- **Object**: Deterministic liquid-handling compiler and dual-backend verifier translating declarative YAML/JSON protocols into idiomatic Opentrons Python API v2 scripts (OT-2 `apiLevel` `2.16` and Opentrons Flex `apiLevel` `2.18`--`2.20` with `requirements` and `load_trash_bin`) plus optional JSON manifests (`--manifest`).
+- **Data**: Strictly validated protocol schema (`metadata`, optional `requirements`, `deck`, `pipettes`, optional `liquids`, and `steps`), built-in catalog of `30` Opentrons OT-2 and Flex labware definitions (including heterogeneous 4x50 mL + 6x15 mL Falcon racks and Flex `50/200/1000 uL` tip racks) and `16` OT-2 Gen1/Gen2 and Flex 1-/8-channel pipettes, `twinstep` protocol importer (`stepbot.interop.from_twinstep`), and `3` end-to-end YAML/Python example pairs.
+- **Model**: Four-stage pipeline (`wells.py` 2D row/column grid & range resolver -> `compiler.py` strict schema validator, macro lowerer, `_TipStateTracker` automaton, and `_WellVolumeTracker` with multi-chunk `distribute` disposal-volume & reagent-lineage tracking -> `codegen.py` slot/mount-sorted Python & manifest emitter -> `checker.py` AST-gated `opentrons.simulate` + execution-safe `MockProtocolContext` -> `mcp_runtime.py` & `robot_http.py` zero-trust `lean-mcp/v1` executor and hardware-optional `:31950` HTTP Run API v2 adapter), backed by machine-checked Lean 4.36.0 proofs in `lean/StepbotLean.lean`.
 - **Training**: Rule-based symbolic compiler (zero learned weights), verified by deterministic codegen checks, strict `mypy` type checking, and `102` pytest cases (`99` passing + `3` real-Opentrons simulator tests skipped when `[sim]` is not installed).
 - **History**: `4534ff1` (2026-11-18, `main` v0.1.0 compiler, mock/Opentrons checker, CLI, examples, and CI) -> `ef6865f` (2026-11-18, `review-fixes` deterministic `apiLevel`, `liquids` & well-volume tracking, multichannel/alias guards) -> full safety, AST mock sandbox, reagent-lineage, `twinstep` interop, and `--manifest` hardening.
-- **Unique Properties**: Byte-reproducible LF code generation across Linux/macOS/Windows, compile-time tip-rack compatibility, liquid-volume conservation, and cross-contamination lineage checks before hardware touch, and direct `L1` integration with [`twinstep`](https://github.com/yaniguan/twinstep), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), [`lab-ears`](https://github.com/yaniguan/lab-ears), [`labshift`](https://github.com/yaniguan/labshift), and [`lab-hands`](https://github.com/yaniguan/lab-hands).
+- **Unique Properties**: Byte-reproducible LF code generation across Linux/macOS/Windows, compile-time tip-rack compatibility, liquid-volume conservation, and cross-contamination lineage checks before hardware touch, and direct `L1` integration across the 15-repository Auto-Lab stack with [`twinstep`](https://github.com/yaniguan/twinstep), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), [`lab-verify`](https://github.com/yaniguan/lab-verify) (`lean-mcp/v1`), [`lab-ears`](https://github.com/yaniguan/lab-ears), [`labshift`](https://github.com/yaniguan/labshift), [`lab-hands`](https://github.com/yaniguan/lab-hands), [`lab-feet`](https://github.com/yaniguan/lab-feet), and downstream post-run partner [`lab-attrib`](https://github.com/yaniguan/lab-attrib) (`stepbot -> lab-attrib` execution telemetry).
 
 Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
 
@@ -34,6 +34,7 @@ Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITEC
 ```text
 stepbot/
 ├── .github/workflows/ci.yml      # Cross-OS mock tests, mypy --strict, and Opentrons sim CI
+├── autolab_wire.py               # 15-repo autolab-wire/v1 L1 compile & Lean-MCP execution node
 ├── docs/
 │   └── ARCHITECTURE_AND_HISTORY.md
 ├── examples/
@@ -82,13 +83,21 @@ stepbot check examples/out/dilution_series.py -v
 1. Canonical HMAC-SHA256 authenticity (`mcp_hmac_authentic`);
 2. Post-compile script SHA-256 binding (`mcp_payload_binding`);
 3. Physical deck epoch freshness (`token_epoch == current_deck_epoch`, `mcp_epoch_freshness`);
-4. Single-use `nonce` replay prevention (`mcp_nonce_single_use`);
-5. Zero-click autonomous execution inside the certified regime (`lean_proof_valid and not is_frontier_exception`) or human-supervisor co-signed frontier override (`mcp_proof_or_cosigned_exception`), monotonically advancing `current_deck_epoch += 1` upon execution.
+4. Bounded FIFO single-use `nonce` replay prevention (`mcp_nonce_single_use`) with crash-safe `os.fsync` + `os.replace` + advisory lockfile `--state` persistence and fail-closed `mcp_state_corrupt` validation;
+5. Script `envelope_bounds` verification (`deck_slots`, `max_transfer_ul`, `api_level`, `mcp_bounds_exceeded`) plus zero-click autonomous execution inside the certified regime (`lean_proof_valid and not is_frontier_exception`) or human-supervisor co-signed frontier override (`mcp_proof_or_cosigned_exception`), with optional two-phase pre-play nonce/epoch commit and `deck_tainted` fault lock over the hardware-optional `OpentronsHttpRunAdapter` (`--robot-url http://<robot-ip>:31950`, verified in CI against a loopback HTTP v2 mock server).
 
 ```bash
 stepbot mcp-compile examples/dilution_series.yaml -o out.py --envelope envelope.json --epoch 1 --secret-key "$LEAN_MCP_SECRET_KEY"
 stepbot mcp-dispatch out.py --envelope envelope.json --state deck_state.json --secret-key "$LEAN_MCP_SECRET_KEY" --mock --json
 ```
+
+## 15-Repository Auto-Lab Wire Contract (`autolab-wire/v1`)
+
+`autolab_wire.py` (`REPO_ID = "stepbot"`, `LAYER = "L1"`) connects `stepbot` to the 15-repository [Auto-Lab](https://github.com/yaniguan/auto-lab) closed-loop packet pipeline (`lab-ears -> lab-ask-why -> lab-decide -> lab-automation-atlas -> buy-or-make -> labshift -> lab-rehearsal -> lab-verify -> stepbot -> lab-hands -> lab-feet -> lab-attrib -> twinstep -> labfill -> labbench-posttrain`):
+
+- **`compile_stage(packet)`**: Compiles `rehearsal.protocol_yaml_dict` (from [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal)) or `examples/plate_fill.yaml` into deterministic Opentrons `apiLevel 2.16` Python code and emits `stepbot_compiled` (`python_code`, `protocol_sha256`, `envelope_bounds`, `self_envelope`) so [`lab-verify`](https://github.com/yaniguan/lab-verify) can co-mint a `lean-mcp/v1` capability token bound to the exact compiled script hash.
+- **`process_packet(packet)`**: Dispatches the compiled script through `StepbotMcpExecutor` (`use_mock=True`, `simulate=True`) using `verification.mcp_envelope` when its `protocol_sha256` matches (or `self_envelope` / `force_envelope` override), halting with `L1_MCP_BLOCK:<rule>` on stale epochs, replayed nonces, or HMAC/SHA-256 tampering (`invariant = "mcp_payload_and_epoch_binding"`).
+- **Downstream Post-Run Telemetry (`stepbot -> lab-feet -> lab-attrib`)**: Emits `stepbot_execution` (`dispatch_receipt`, `protocol_sha256`, `mcp_envelope`, `next_deck_epoch`, and structured `telemetry` containing `well_volumes_ul`, `well_levels_ul`, `tips_consumed`, `tip_telemetry`, and Poiseuille/rheology `rheology_and_pressure` diagnostics), merges non-clobbering L1 fields into `assay_telemetry`, updates bounded `consumed_nonces`, and advances `deck_epoch` for [`lab-feet`](https://github.com/yaniguan/lab-feet) (`L0` INT8/4-bit bench runtime) and downstream post-run causal blame partner [`lab-attrib`](https://github.com/yaniguan/lab-attrib) (`L4`), which fuses robotic liquid-handling execution telemetry with NNLS precursor deconvolution to quarantine `EXECUTION_ARTIFACT` runs before SFT/RLVR memory admission.
 
 ## Input format
 

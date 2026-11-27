@@ -15,10 +15,15 @@ import yaml
 
 from stepbot.catalog import (
     DEFAULT_API_LEVEL,
+    DEFAULT_FLEX_TRASH_SLOT,
+    FLEX_DEFAULT_API_LEVEL,
+    FLEX_STAGING_SLOTS,
     expected_tip_family_description,
     get_labware_spec,
     get_pipette_spec,
+    is_flex_pipette,
     is_tip_rack_compatible,
+    is_valid_flex_slot,
     parse_api_level,
 )
 from stepbot.codegen import build_protocol_manifest, render_protocol
@@ -26,6 +31,7 @@ from stepbot.models import (
     VOLUME_TOLERANCE,
     CommentStep,
     DeckItem,
+    DeckSlot,
     DelayStep,
     DiscardStep,
     DistributeStep,
@@ -46,14 +52,49 @@ from stepbot.models import (
 from stepbot.wells import resolve_serial_wells, resolve_well_refs
 
 # Names used by the generated code itself; deck aliases must not shadow them.
-_RESERVED_NAMES = {"protocol", "metadata", "liquids", "pipette_left", "pipette_right"}
+_RESERVED_NAMES = {
+    "protocol",
+    "metadata",
+    "requirements",
+    "liquids",
+    "pipette_left",
+    "pipette_right",
+}
 _VALID_NEW_TIP = {"once", "always", "never"}
 _API_LEVEL_RE = re.compile(r"^\d+\.\d+$")
 # Well.load_liquid and ProtocolContext.define_liquid need API level 2.14 or newer.
 _MIN_LIQUID_API_LEVEL = (2, 14)
+_MIN_FLEX_API_LEVEL = (2, 15)
 
-_ROOT_KEYS = {"metadata", "deck", "pipettes", "liquids", "steps", "allow_contamination"}
-_METADATA_KEYS = {"name", "protocolName", "description", "author", "apiLevel"}
+_ROOT_KEYS = {
+    "metadata",
+    "requirements",
+    "robot_type",
+    "trash_slot",
+    "deck",
+    "pipettes",
+    "liquids",
+    "steps",
+    "allow_contamination",
+}
+_METADATA_KEYS = {
+    "name",
+    "protocolName",
+    "description",
+    "author",
+    "apiLevel",
+    "robotType",
+    "robot_type",
+    "trashSlot",
+    "trash_slot",
+}
+_REQUIREMENTS_KEYS = {
+    "robotType",
+    "robot_type",
+    "apiLevel",
+    "trashSlot",
+    "trash_slot",
+}
 _DECK_ENTRY_KEYS = {"labware", "slot"}
 _PIPETTE_ENTRY_KEYS = {"model", "name", "tip_racks"}
 _LIQUID_ENTRY_KEYS = {
@@ -64,6 +105,7 @@ _LIQUID_ENTRY_KEYS = {
     "color",
     "display_color",
     "well_order",
+    "liquid_class",
 }
 _MIX_AFTER_KEYS = {"reps", "repetitions", "volume"}
 
@@ -106,6 +148,16 @@ _STEP_ALLOWED_KEYS: dict[str, set[str]] = {
         "reps",
         "repetitions",
         "new_tip",
+        "allow_contamination",
+        "well_order",
+    },
+    "discard": {
+        "pipette",
+        "src",
+        "source",
+        "volume",
+        "new_tip",
+        "multi_aspirate",
         "allow_contamination",
         "well_order",
     },
@@ -186,11 +238,99 @@ def _require_identifier(name: str, kind: str) -> str:
     return name
 
 
-def _parse_deck(raw_deck: Any) -> dict[str, DeckItem]:
+def _normalize_robot_type(raw: Any, label: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValidationError(f"{label} must be 'OT-2' or 'Flex', got {raw!r}")
+    token = raw.strip()
+    if token in ("OT-2", "OT2"):
+        return "OT-2"
+    if token in ("Flex", "OT-3"):
+        return "Flex"
+    raise ValidationError(f"Unsupported {label} {raw!r}: expected 'OT-2' or 'Flex'")
+
+
+def _resolve_robot_and_api_level(
+    data: dict[str, Any],
+    metadata: dict[str, Any],
+) -> tuple[str, str, str | None]:
+    raw_reqs = data.get("requirements")
+    requirements: dict[str, Any] = {}
+    if raw_reqs is not None:
+        if not isinstance(raw_reqs, dict):
+            raise ValidationError("'requirements' must be a mapping")
+        _check_allowed_keys(raw_reqs, _REQUIREMENTS_KEYS, "'requirements'")
+        requirements = raw_reqs
+
+    robot_candidates: list[str] = []
+    for src_val, label in (
+        (data.get("robot_type"), "robot_type"),
+        (requirements.get("robotType"), "requirements.robotType"),
+        (requirements.get("robot_type"), "requirements.robot_type"),
+        (metadata.get("robotType"), "metadata.robotType"),
+        (metadata.get("robot_type"), "metadata.robot_type"),
+    ):
+        if src_val is not None:
+            robot_candidates.append(_normalize_robot_type(src_val, label))
+
+    if len(set(robot_candidates)) > 1:
+        raise ValidationError(
+            f"Conflicting robot_type declarations: {sorted(set(robot_candidates))}"
+        )
+    robot_type = robot_candidates[0] if robot_candidates else "OT-2"
+
+    meta_api = metadata.get("apiLevel")
+    req_api = requirements.get("apiLevel")
+    if meta_api is not None and req_api is not None and meta_api != req_api:
+        raise ValidationError(
+            f"Conflicting apiLevel between metadata ({meta_api!r}) and requirements ({req_api!r})"
+        )
+    raw_api = req_api if req_api is not None else meta_api
+    default_api = FLEX_DEFAULT_API_LEVEL if robot_type == "Flex" else DEFAULT_API_LEVEL
+    api_level = _parse_api_level(raw_api, default_level=default_api)
+
+    if robot_type == "Flex" and parse_api_level(api_level) < _MIN_FLEX_API_LEVEL:
+        raise ValidationError(
+            f"Opentrons Flex requires apiLevel {_MIN_FLEX_API_LEVEL[0]}.{_MIN_FLEX_API_LEVEL[1]} "
+            f"or newer, got '{api_level}'"
+        )
+
+    raw_trash: Any = None
+    for candidate in (
+        data.get("trash_slot"),
+        requirements.get("trashSlot"),
+        requirements.get("trash_slot"),
+        metadata.get("trashSlot"),
+        metadata.get("trash_slot"),
+    ):
+        if candidate is not None:
+            raw_trash = candidate
+            break
+
+    if robot_type == "OT-2":
+        if raw_trash is not None:
+            raise ValidationError("trash_slot is only configurable on Opentrons Flex protocols")
+        return robot_type, api_level, None
+
+    trash_slot = DEFAULT_FLEX_TRASH_SLOT if raw_trash is None else raw_trash
+    if not is_valid_flex_slot(trash_slot, allow_staging=False):
+        raise ValidationError(
+            f"Invalid Flex trash_slot {trash_slot!r}: expected an addressable deck slot 'A1'..'D3'"
+        )
+    return robot_type, api_level, str(trash_slot)
+
+
+def _parse_deck(
+    raw_deck: Any,
+    *,
+    robot_type: str = "OT-2",
+    trash_slot: str | None = None,
+) -> dict[str, DeckItem]:
     if not isinstance(raw_deck, dict) or not raw_deck:
         raise ValidationError("'deck' must be a non-empty mapping of alias -> {labware, slot}")
     deck: dict[str, DeckItem] = {}
-    used_slots: dict[int, str] = {}
+    used_slots: dict[DeckSlot, str] = {}
+    eff_trash = (trash_slot or DEFAULT_FLEX_TRASH_SLOT) if robot_type == "Flex" else None
+
     for alias, entry in raw_deck.items():
         _require_identifier(alias, "Deck alias")
         if not isinstance(entry, dict):
@@ -203,20 +343,43 @@ def _parse_deck(raw_deck: Any) -> dict[str, DeckItem]:
         spec = get_labware_spec(load_name)
         if spec is None:
             raise ValidationError(f"Unknown Opentrons labware '{load_name}' for '{alias}'")
-        if isinstance(slot, bool) or not isinstance(slot, int) or not (1 <= slot <= 11):
+
+        resolved_slot: DeckSlot
+        if robot_type == "Flex":
+            if not is_valid_flex_slot(slot, allow_staging=True):
+                raise ValidationError(
+                    f"Invalid slot {slot!r} for '{alias}': Opentrons Flex slot must be "
+                    "a coordinate string 'A1'..'D3' (or staging 'A4'..'D4')"
+                )
+            resolved_slot = str(slot)
+            if eff_trash is not None and resolved_slot == eff_trash:
+                raise ValidationError(
+                    f"Deck slot '{resolved_slot}' for '{alias}' collides with the Flex trash bin "
+                    f"slot '{eff_trash}' (move labware or configure a different trash_slot)"
+                )
+        else:
+            if isinstance(slot, bool) or not isinstance(slot, int) or not (1 <= slot <= 11):
+                raise ValidationError(
+                    f"Invalid slot '{slot}' for '{alias}': slot must be an integer between 1 and 11"
+                )
+            resolved_slot = slot
+
+        if resolved_slot in used_slots:
             raise ValidationError(
-                f"Invalid slot '{slot}' for '{alias}': slot must be an integer between 1 and 11"
+                f"Duplicate deck slot {resolved_slot}: used by both "
+                f"'{used_slots[resolved_slot]}' and '{alias}'"
             )
-        if slot in used_slots:
-            raise ValidationError(
-                f"Duplicate deck slot {slot}: used by both '{used_slots[slot]}' and '{alias}'"
-            )
-        used_slots[slot] = alias
-        deck[alias] = DeckItem(alias=alias, load_name=load_name, slot=slot, spec=spec)
+        used_slots[resolved_slot] = alias
+        deck[alias] = DeckItem(alias=alias, load_name=load_name, slot=resolved_slot, spec=spec)
     return deck
 
 
-def _parse_pipettes(raw_pipettes: Any, deck: dict[str, DeckItem]) -> dict[str, PipetteConfig]:
+def _parse_pipettes(
+    raw_pipettes: Any,
+    deck: dict[str, DeckItem],
+    *,
+    robot_type: str = "OT-2",
+) -> dict[str, PipetteConfig]:
     if not isinstance(raw_pipettes, dict) or not raw_pipettes:
         raise ValidationError("'pipettes' must be a non-empty mapping of mount -> {model, tip_racks}")
     pipettes: dict[str, PipetteConfig] = {}
@@ -232,11 +395,23 @@ def _parse_pipettes(raw_pipettes: Any, deck: dict[str, DeckItem]) -> dict[str, P
         spec = get_pipette_spec(model)
         if spec is None:
             raise ValidationError(f"Unknown Opentrons pipette model '{model}' on mount '{mount}'")
-        if spec.channels > 1:
-            raise ValidationError(
-                f"Multichannel pipette '{model}' on mount '{mount}' is not supported yet: "
-                "tip counting and well targeting assume a single-channel pipette"
-            )
+        if robot_type == "Flex":
+            if not is_flex_pipette(model):
+                raise ValidationError(
+                    f"OT-2 pipette '{model}' on mount '{mount}' is incompatible with "
+                    "Opentrons Flex (expected 'flex_1channel_*' or 'flex_8channel_*')"
+                )
+        else:
+            if is_flex_pipette(model):
+                raise ValidationError(
+                    f"Opentrons Flex pipette '{model}' on mount '{mount}' requires "
+                    "robot_type 'Flex'"
+                )
+            if spec.channels > 1:
+                raise ValidationError(
+                    f"Multichannel pipette '{model}' on mount '{mount}' is not supported yet: "
+                    "tip counting and well targeting assume a single-channel pipette on OT-2"
+                )
         tip_racks = entry.get("tip_racks")
         if not isinstance(tip_racks, list) or not tip_racks:
             raise ValidationError(f"Pipette '{mount}' must define a non-empty 'tip_racks' list")
@@ -251,6 +426,10 @@ def _parse_pipettes(raw_pipettes: Any, deck: dict[str, DeckItem]) -> dict[str, P
             if not rack_item.spec.is_tiprack:
                 raise ValidationError(
                     f"Deck item '{rack_alias}' ({rack_item.load_name}) is not a tip rack"
+                )
+            if isinstance(rack_item.slot, str) and rack_item.slot in FLEX_STAGING_SLOTS:
+                raise ValidationError(
+                    f"Tip rack '{rack_alias}' cannot be placed in Flex staging slot '{rack_item.slot}'"
                 )
             if not is_tip_rack_compatible(spec, rack_item.spec):
                 raise ValidationError(
@@ -271,19 +450,19 @@ def _parse_pipettes(raw_pipettes: Any, deck: dict[str, DeckItem]) -> dict[str, P
     return pipettes
 
 
-def _parse_api_level(raw: Any) -> str:
+def _parse_api_level(raw: Any, *, default_level: str = DEFAULT_API_LEVEL) -> str:
     if raw is None:
-        return DEFAULT_API_LEVEL
+        return default_level
     if not isinstance(raw, str):
         raise ValidationError(
-            f"metadata.apiLevel must be a quoted string such as \"{DEFAULT_API_LEVEL}\", "
+            f"metadata.apiLevel must be a quoted string such as \"{default_level}\", "
             f"got {raw!r} ({type(raw).__name__}); unquoted YAML numbers drop trailing "
             "zeros, so 2.10 is read as 2.1"
         )
     level = raw.strip()
     if not _API_LEVEL_RE.match(level):
         raise ValidationError(
-            f"metadata.apiLevel '{raw}' must look like '<major>.<minor>', e.g. \"{DEFAULT_API_LEVEL}\""
+            f"metadata.apiLevel '{raw}' must look like '<major>.<minor>', e.g. \"{default_level}\""
         )
     major, minor = parse_api_level(level)
     if f"{major}.{minor}" != level:
@@ -293,6 +472,48 @@ def _parse_api_level(raw: Any) -> str:
             f"metadata.apiLevel '{raw}' is not supported: only Opentrons Python API v2 (2.x) is targeted"
         )
     return level
+
+
+def _reject_staging_well_refs(
+    wells: list[WellRef],
+    deck: dict[str, DeckItem],
+    label: str,
+) -> None:
+    for ref in wells:
+        slot = deck[ref.labware].slot
+        if isinstance(slot, str) and slot in FLEX_STAGING_SLOTS:
+            raise ValidationError(
+                f"{label}: pipettes cannot access labware '{ref.labware}' in Flex staging slot '{slot}'"
+            )
+
+
+def _resolve_channel_target(
+    ref: WellRef,
+    deck: dict[str, DeckItem],
+    channels: int,
+    label: str,
+) -> tuple[tuple[WellRef, ...], int]:
+    """Expand a well target for 1- or 8-channel pipettes into `(affected_wells, stroke_multiplier)`."""
+    if channels == 1:
+        return (ref,), 1
+    item = deck[ref.labware]
+    row, col = item.spec.well_grid[ref.well]
+    if row != 0:
+        raise ValidationError(
+            f"{label}: {channels}-channel pipette must target row 'A' column heads "
+            f"(e.g. '{ref.labware}:A{col + 1}'), got '{ref.key()}'"
+        )
+    col_entries = sorted(
+        (r, w_name) for w_name, (r, c) in item.spec.well_grid.items() if c == col
+    )
+    if len(col_entries) == 1:
+        return (ref,), channels
+    if len(col_entries) == channels and [r for r, _ in col_entries] == list(range(channels)):
+        return tuple(WellRef(ref.labware, w_name) for _, w_name in col_entries), 1
+    raise ValidationError(
+        f"{label}: {channels}-channel pipette cannot address {len(col_entries)}-row labware "
+        f"'{ref.labware}' ({item.load_name}); expected {channels}-row plate or 1-row reservoir"
+    )
 
 
 def _parse_liquids(raw_liquids: Any, deck: dict[str, DeckItem]) -> tuple[LiquidSpec, ...]:
@@ -469,18 +690,22 @@ class _TipStateTracker:
         self.tips_used_per_mount: dict[str, int] = {mount: 0 for mount in pipettes}
         self.pipettes = pipettes
 
-    def consume_tips(self, mount: str, count: int) -> None:
-        if count <= 0:
+    def consume_tips(self, mount: str, pickup_count: int) -> None:
+        if pickup_count <= 0:
             return
-        needed = count
+        channels = self.pipettes[mount].spec.channels
+        physical_tips = pickup_count * channels
+        needed = physical_tips
         for rack_alias in self.pipettes[mount].tip_racks:
             avail = self.rack_remaining[rack_alias]
+            if channels > 1:
+                avail = (avail // channels) * channels
             if avail >= needed:
                 self.rack_remaining[rack_alias] -= needed
-                self.tips_used_per_mount[mount] += count
+                self.tips_used_per_mount[mount] += physical_tips
                 return
             needed -= avail
-            self.rack_remaining[rack_alias] = 0
+            self.rack_remaining[rack_alias] -= avail
         total_capacity = sum(
             len(self.deck[r].spec.wells) for r in self.pipettes[mount].tip_racks
         )
@@ -623,6 +848,7 @@ class _WellVolumeTracker:
 
         if isinstance(step, TransferStep):
             pip = self.pipettes[step.pipette]
+            channels = pip.spec.channels
             max_vol = pip.effective_max_volume
             strokes = max(1, math.ceil((step.volume - VOLUME_TOLERANCE) / max_vol))
             stroke_vol = step.volume / strokes
@@ -636,20 +862,25 @@ class _WellVolumeTracker:
             if step.new_tip == "once":
                 self.tip_species[step.pipette] = set()
             for src, dst in zip(srcs, dsts):
+                src_wells, src_mult = _resolve_channel_target(src, self.deck, channels, label)
+                dst_wells, dst_mult = _resolve_channel_target(dst, self.deck, channels, label)
                 if step.new_tip == "always":
                     self.tip_species[step.pipette] = set()
                 for _ in range(strokes):
-                    self._aspirate_species(
-                        step.pipette, src, label, allow_contamination=allow_contamination
-                    )
-                    self.remove(src, stroke_vol, label)
-                    self._dispense_species(step.pipette, dst)
-                    self.add(dst, stroke_vol, label)
+                    for s_ref in src_wells:
+                        self._aspirate_species(
+                            step.pipette, s_ref, label, allow_contamination=allow_contamination
+                        )
+                        self.remove(s_ref, stroke_vol * src_mult, label)
+                    for d_ref in dst_wells:
+                        self._dispense_species(step.pipette, d_ref)
+                        self.add(d_ref, stroke_vol * dst_mult, label)
                 if step.mix_after is not None:
-                    self.check_mix(dst, step.mix_after[1], label)
-                    self._mix_species(
-                        step.pipette, dst, label, allow_contamination=allow_contamination
-                    )
+                    for d_ref in dst_wells:
+                        self.check_mix(d_ref, step.mix_after[1] * dst_mult, label)
+                        self._mix_species(
+                            step.pipette, d_ref, label, allow_contamination=allow_contamination
+                        )
                 if step.new_tip == "always":
                     self.tip_species[step.pipette] = set()
             if step.new_tip == "once":
@@ -657,6 +888,7 @@ class _WellVolumeTracker:
 
         elif isinstance(step, DistributeStep):
             pip = self.pipettes[step.pipette]
+            channels = pip.spec.channels
             disp_vol = (
                 pip.spec.min_volume if step.disposal_volume is None else step.disposal_volume
             )
@@ -665,32 +897,44 @@ class _WellVolumeTracker:
             num_chunks = math.ceil(len(step.dst) / batch_count) if step.dst else 0
             total_aspirated = step.volume * len(step.dst) + disp_vol * num_chunks
 
+            src_wells, src_mult = _resolve_channel_target(step.src, self.deck, channels, label)
             if step.new_tip == "once":
                 self.tip_species[step.pipette] = set()
-            self._aspirate_species(
-                step.pipette, step.src, label, allow_contamination=allow_contamination
-            )
-            self.remove(step.src, total_aspirated, label)
+            for s_ref in src_wells:
+                self._aspirate_species(
+                    step.pipette, s_ref, label, allow_contamination=allow_contamination
+                )
+                self.remove(s_ref, total_aspirated * src_mult, label)
             for dst in step.dst:
-                self._dispense_species(step.pipette, dst)
-                self.add(dst, step.volume, label)
+                dst_wells, dst_mult = _resolve_channel_target(dst, self.deck, channels, label)
+                for d_ref in dst_wells:
+                    self._dispense_species(step.pipette, d_ref)
+                    self.add(d_ref, step.volume * dst_mult, label)
             if step.new_tip == "once":
                 self.tip_species[step.pipette] = set()
 
         elif isinstance(step, MixStep):
+            pip = self.pipettes[step.pipette]
+            channels = pip.spec.channels
             for well in step.wells:
-                self.check_mix(well, step.volume, label)
-                self._mix_species(
-                    step.pipette, well, label, allow_contamination=allow_contamination
-                )
+                w_refs, w_mult = _resolve_channel_target(well, self.deck, channels, label)
+                for w_ref in w_refs:
+                    self.check_mix(w_ref, step.volume * w_mult, label)
+                    self._mix_species(
+                        step.pipette, w_ref, label, allow_contamination=allow_contamination
+                    )
 
         elif isinstance(step, DiscardStep):
+            pip = self.pipettes[step.pipette]
+            channels = pip.spec.channels
+            src_wells, src_mult = _resolve_channel_target(step.src, self.deck, channels, label)
             stroke_vol = step.volume / max(1, step.strokes)
             for _ in range(max(1, step.strokes)):
-                self._aspirate_species(
-                    step.pipette, step.src, label, allow_contamination=allow_contamination
-                )
-                self.remove(step.src, stroke_vol, label)
+                for s_ref in src_wells:
+                    self._aspirate_species(
+                        step.pipette, s_ref, label, allow_contamination=allow_contamination
+                    )
+                    self.remove(s_ref, stroke_vol * src_mult, label)
 
     def summaries(self) -> dict[str, WellSummary]:
         all_wells = set(self.initial_volumes) | set(self.volumes) | set(self.peak_volumes)
@@ -727,6 +971,7 @@ def _lower_transfer(
         raise ValidationError("transfer step requires 'src' and 'dst'")
     src = resolve_well_refs(raw_src, deck, well_order=well_order)
     dst = resolve_well_refs(raw_dst, deck, well_order=well_order)
+    _reject_staging_well_refs(src + dst, deck, "transfer")
     if len(src) > 1 and len(dst) > 1 and len(src) != len(dst):
         raise ValidationError(
             f"transfer source count ({len(src)}) and destination count ({len(dst)}) mismatch"
@@ -792,6 +1037,7 @@ def _lower_distribute(
     if len(src) != 1:
         raise ValidationError(f"distribute requires a single source well, got {len(src)}")
     dst = resolve_well_refs(raw_dst, deck, well_order=well_order)
+    _reject_staging_well_refs(src + dst, deck, "distribute")
     vol, _ = _check_volume(params.get("volume"), pip, "distribute")
     new_tip = params.get("new_tip", "once")
     if new_tip not in ("once", "never"):
@@ -847,6 +1093,7 @@ def _lower_mix(
     if raw_wells is None:
         raise ValidationError("mix step requires 'well' or 'wells'")
     wells = resolve_well_refs(raw_wells, deck, well_order=well_order)
+    _reject_staging_well_refs(wells, deck, "mix")
     vol, _ = _check_volume(params.get("volume"), pip, "mix")
     reps = params.get("reps", params.get("repetitions"))
     if isinstance(reps, bool) or not isinstance(reps, int) or reps < 1:
@@ -870,6 +1117,48 @@ def _lower_mix(
             tracker.consume_tips(pip.mount, 1)
             out.append(PickUpTipStep(pipette=pip.mount))
             out.append(MixStep(pipette=pip.mount, wells=(well,), volume=vol, reps=reps))
+            out.append(DropTipStep(pipette=pip.mount))
+
+
+def _lower_discard(
+    params: dict[str, Any],
+    deck: dict[str, DeckItem],
+    pipettes: dict[str, PipetteConfig],
+    tracker: _TipStateTracker,
+    out: list[LoweredStep],
+) -> None:
+    pip = _select_pipette(params, pipettes)
+    well_order = str(params.get("well_order", "row"))
+    multi_aspirate = _parse_bool(params.get("multi_aspirate"), "discard 'multi_aspirate'")
+    raw_src = params.get("src", params.get("source"))
+    if raw_src is None:
+        raise ValidationError("discard step requires 'src'")
+    srcs = resolve_well_refs(raw_src, deck, well_order=well_order)
+    _reject_staging_well_refs(srcs, deck, "discard")
+    vol, strokes = _check_volume(
+        params.get("volume"), pip, "discard", multi_aspirate=multi_aspirate
+    )
+    new_tip = params.get("new_tip", "once")
+    if new_tip not in _VALID_NEW_TIP:
+        raise ValidationError(f"Invalid new_tip '{new_tip}' in discard")
+
+    if new_tip == "never":
+        tracker.ensure_has_tip(pip.mount, out)
+        for s_ref in srcs:
+            out.append(DiscardStep(pipette=pip.mount, src=s_ref, volume=vol, strokes=strokes))
+    elif new_tip == "once":
+        tracker.ensure_no_tip(pip.mount, out)
+        tracker.consume_tips(pip.mount, 1)
+        out.append(PickUpTipStep(pipette=pip.mount))
+        for s_ref in srcs:
+            out.append(DiscardStep(pipette=pip.mount, src=s_ref, volume=vol, strokes=strokes))
+        out.append(DropTipStep(pipette=pip.mount))
+    else:
+        tracker.ensure_no_tip(pip.mount, out)
+        for s_ref in srcs:
+            tracker.consume_tips(pip.mount, 1)
+            out.append(PickUpTipStep(pipette=pip.mount))
+            out.append(DiscardStep(pipette=pip.mount, src=s_ref, volume=vol, strokes=strokes))
             out.append(DropTipStep(pipette=pip.mount))
 
 
@@ -915,6 +1204,7 @@ def _lower_dilution_series(
         raise ValidationError("dilution_series 'source' and 'diluent' must each be a single well")
 
     series_wells = resolve_serial_wells(raw_first, count, deck, direction=str(direction))
+    _reject_staging_well_refs(source_refs + diluent_refs + series_wells, deck, "dilution_series")
     if source_refs[0] == diluent_refs[0]:
         raise ValidationError(
             f"dilution_series 'source' and 'diluent' must be distinct wells, "
@@ -1030,10 +1320,10 @@ def parse_and_validate(data: dict[str, Any]) -> ProtocolSpec:
     _check_allowed_keys(metadata, _METADATA_KEYS, "'metadata'")
     name = str(metadata.get("name", metadata.get("protocolName", "Stepbot Protocol")))
     description = str(metadata.get("description", ""))
-    api_level = _parse_api_level(metadata.get("apiLevel"))
+    robot_type, api_level, trash_slot = _resolve_robot_and_api_level(data, metadata)
 
-    deck = _parse_deck(data.get("deck"))
-    pipettes = _parse_pipettes(data.get("pipettes"), deck)
+    deck = _parse_deck(data.get("deck"), robot_type=robot_type, trash_slot=trash_slot)
+    pipettes = _parse_pipettes(data.get("pipettes"), deck, robot_type=robot_type)
     liquids = _parse_liquids(data.get("liquids"), deck)
     if liquids and parse_api_level(api_level) < _MIN_LIQUID_API_LEVEL:
         raise ValidationError(
@@ -1095,6 +1385,8 @@ def parse_and_validate(data: dict[str, Any]) -> ProtocolSpec:
             _lower_distribute(params, deck, pipettes, tracker, lowered)
         elif kind == "mix":
             _lower_mix(params, deck, pipettes, tracker, lowered)
+        elif kind == "discard":
+            _lower_discard(params, deck, pipettes, tracker, lowered)
         elif kind == "dilution_series":
             _lower_dilution_series(params, deck, pipettes, tracker, lowered)
 
@@ -1125,6 +1417,8 @@ def parse_and_validate(data: dict[str, Any]) -> ProtocolSpec:
         tips_used_per_mount=dict(tracker.tips_used_per_mount),
         well_summaries=volumes.summaries(),
         step_origins=tuple(origins),
+        robot_type=robot_type,
+        trash_slot=trash_slot,
     )
 
 

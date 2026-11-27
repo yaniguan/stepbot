@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from stepbot.catalog import DEFAULT_FLEX_TRASH_SLOT, deck_slot_sort_key
 from stepbot.models import (
     CommentStep,
     DelayStep,
@@ -42,21 +43,39 @@ def _pip_var(mount: str) -> str:
 def render_protocol(spec: ProtocolSpec) -> str:
     """Render a validated ProtocolSpec into deterministic Python source."""
     lines: list[str] = []
+    is_flex = spec.robot_type == "Flex"
+
     meta_parts = [f'"protocolName": {spec.name!r}']
     if spec.description:
         meta_parts.append(f'"description": {spec.description!r}')
-    meta_parts.append(f'"apiLevel": {spec.api_level!r}')
+    if not is_flex:
+        meta_parts.append(f'"apiLevel": {spec.api_level!r}')
     lines.append("metadata = {")
     for part in meta_parts:
         lines.append(f"    {part},")
     lines.append("}")
+
+    if is_flex:
+        lines.append("")
+        lines.append("requirements = {")
+        lines.append('    "robotType": \'Flex\',')
+        lines.append(f'    "apiLevel": {spec.api_level!r},')
+        lines.append("}")
+
     lines.append("")
     lines.append("")
     lines.append("def run(protocol):")
 
-    for item in sorted(spec.deck.values(), key=lambda d: d.slot):
+    trash_expr = "protocol.fixed_trash"
+    if is_flex:
+        trash_var = "trash" if "trash" not in spec.deck else "trash_bin"
+        trash_slot = spec.trash_slot or DEFAULT_FLEX_TRASH_SLOT
+        lines.append(f"    {trash_var} = protocol.load_trash_bin({trash_slot!r})")
+        trash_expr = trash_var
+
+    for item in sorted(spec.deck.values(), key=lambda d: deck_slot_sort_key(d.slot)):
         lines.append(
-            f"    {item.alias} = protocol.load_labware({item.load_name!r}, {item.slot})"
+            f"    {item.alias} = protocol.load_labware({item.load_name!r}, {item.slot!r})"
         )
     lines.append("")
 
@@ -140,8 +159,8 @@ def render_protocol(spec: ProtocolSpec) -> str:
             stroke_vol = step.volume / max(1, step.strokes)
             for _ in range(max(1, step.strokes)):
                 lines.append(f"    {pv}.aspirate({_fmt_num(stroke_vol)}, {step.src.expr()})")
-                lines.append(f"    {pv}.dispense({_fmt_num(stroke_vol)}, protocol.fixed_trash)")
-                lines.append(f"    {pv}.blow_out(protocol.fixed_trash)")
+                lines.append(f"    {pv}.dispense({_fmt_num(stroke_vol)}, {trash_expr})")
+                lines.append(f"    {pv}.blow_out({trash_expr})")
 
     lines.append("")
     return "\n".join(lines)
@@ -225,7 +244,7 @@ def build_protocol_manifest(spec: ProtocolSpec, source: str | None = None) -> di
             "slot": item.slot,
             "is_tiprack": item.spec.is_tiprack,
         }
-        for item in sorted(spec.deck.values(), key=lambda d: d.slot)
+        for item in sorted(spec.deck.values(), key=lambda d: deck_slot_sort_key(d.slot))
     }
     pipette_manifest = {
         mount: {
@@ -256,7 +275,7 @@ def build_protocol_manifest(spec: ProtocolSpec, source: str | None = None) -> di
         for idx, step in enumerate(spec.steps)
     ]
 
-    return {
+    out: dict[str, Any] = {
         "schema_version": "1.0",
         "protocol_name": spec.name,
         "description": spec.description,
@@ -269,3 +288,7 @@ def build_protocol_manifest(spec: ProtocolSpec, source: str | None = None) -> di
         "well_volumes": well_volumes,
         "steps": steps_manifest,
     }
+    if spec.robot_type != "OT-2":
+        out["robot_type"] = spec.robot_type
+        out["trash_slot"] = spec.trash_slot or DEFAULT_FLEX_TRASH_SLOT
+    return out

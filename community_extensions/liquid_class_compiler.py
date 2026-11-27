@@ -237,6 +237,8 @@ def render_opentrons_v216_script(plan: LoweredTransferPlan, dst_wells: tuple[str
         '    plate = protocol.load_labware("corning_96_wellplate_360ul_flat", 2)',
         '    tips = protocol.load_labware("opentrons_96_tiprack_300ul", 3)',
         '    pipette_left = protocol.load_instrument("p300_single_gen2", "left", tip_racks=[tips])',
+        f"    reagent = protocol.define_liquid({plan.liquid_class!r}, description='', display_color=None)",
+        f"    reservoir[{plan.active_source_well!r}].load_liquid(liquid=reagent, volume={plan.active_source_volume_ul:.2f})",
         f"    pipette_left.flow_rate.aspirate = {plan.aspirate_rate_ul_s:.2f}",
         f"    pipette_left.flow_rate.dispense = {plan.dispense_rate_ul_s:.2f}",
         "    pipette_left.pick_up_tip()",

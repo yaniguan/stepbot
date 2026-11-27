@@ -12,17 +12,23 @@ from typing import Any
 
 from stepbot.catalog import (
     DEFAULT_API_LEVEL,
+    DEFAULT_FLEX_TRASH_SLOT,
+    FLEX_STAGING_SLOTS,
+    deck_slot_sort_key,
     expected_tip_family_description,
     get_labware_spec,
     get_pipette_spec,
     installed_max_api_level,
+    is_flex_pipette,
     is_tip_rack_compatible,
+    is_valid_flex_slot,
     parse_api_level,
 )
-from stepbot.models import VOLUME_TOLERANCE, LabwareSpec, PipetteSpec
+from stepbot.models import VOLUME_TOLERANCE, DeckSlot, LabwareSpec, PipetteSpec
 
 _API_LEVEL_RE = re.compile(r"^\d+\.\d+$")
 _MIN_LIQUID_API_LEVEL = (2, 14)
+_MIN_FLEX_API_LEVEL = (2, 15)
 _MAX_LOOP_ITERATIONS = 10_000
 
 
@@ -42,11 +48,20 @@ class CheckResult:
     line_count: int
     lines: tuple[str, ...]
     errors: tuple[str, ...] = ()
+    api_level: str | None = None
+    robot_type: str = "OT-2"
+    loaded_slots: tuple[DeckSlot, ...] = ()
+    max_op_volume_ul: float = 0.0
+    well_volumes_ul: dict[str, float] = field(default_factory=dict)
+    tips_used_per_mount: dict[str, int] = field(default_factory=dict)
 
 
 class _MockTrash:
+    def __init__(self, slot: DeckSlot = 12) -> None:
+        self.slot = slot
+
     def __repr__(self) -> str:
-        return "Trash Bin on slot 12"
+        return f"Trash Bin on slot {self.slot}"
 
 
 @dataclass(frozen=True)
@@ -56,15 +71,38 @@ class _MockLiquid:
     display_color: str | None = None
 
 
+@dataclass(frozen=True)
+class _MockLocation:
+    well: _MockWell
+    anchor: str
+    offset_mm: float | None = None
+
+    def __str__(self) -> str:
+        return str(self.well)
+
+
+class _MockFlowRate:
+    def __init__(
+        self,
+        aspirate: float = 92.86,
+        dispense: float = 92.86,
+        blow_out: float = 92.86,
+    ) -> None:
+        self.aspirate = aspirate
+        self.dispense = dispense
+        self.blow_out = blow_out
+
+
 @dataclass(eq=False)
 class _MockWell:
     labware_name: str
-    slot: int
+    slot: DeckSlot
     well_name: str
     max_volume: float
     api_level: tuple[int, int] = (2, 16)
     has_tip: bool = False
     volume: float = field(default=0.0)
+    _touched: bool = field(default=False)
 
     def __str__(self) -> str:
         return f"{self.well_name} of {self.labware_name} on slot {self.slot}"
@@ -75,34 +113,53 @@ class _MockWell:
                 f"Well.load_liquid requires apiLevel 2.14 or newer, "
                 f"got '{self.api_level[0]}.{self.api_level[1]}'"
             )
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)):
+            raise ValueError(f"Liquid volume must be a number, got {volume!r}")
         if volume < 0 or volume > self.max_volume + VOLUME_TOLERANCE:
             raise ValueError(
                 f"Cannot load {volume} uL of '{liquid.name}' into {self}: "
                 f"well capacity is {self.max_volume} uL"
             )
         self.volume = float(volume)
+        self._touched = True
 
-    def remove_volume(self, volume: float) -> None:
+    def top(self, z: float | None = None) -> _MockLocation:
+        if z is not None and (isinstance(z, bool) or not isinstance(z, (int, float))):
+            raise ValueError(f"Well.top(z) offset must be numeric, got {z!r}")
+        return _MockLocation(self, "top", float(z) if z is not None else None)
+
+    def bottom(self, z: float | None = None) -> _MockLocation:
+        if z is not None and (isinstance(z, bool) or not isinstance(z, (int, float))):
+            raise ValueError(f"Well.bottom(z) offset must be numeric, got {z!r}")
+        return _MockLocation(self, "bottom", float(z) if z is not None else None)
+
+    def _remove_volume(self, volume: float) -> None:
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume < 0:
+            raise ValueError(f"Aspirate volume must be a non-negative number, got {volume!r}")
         if volume > self.volume + VOLUME_TOLERANCE:
             raise ValueError(
                 f"Cannot aspirate {volume} uL from {self}: well holds only {self.volume:.2f} uL"
             )
-        self.volume = max(0.0, self.volume - volume)
+        self.volume = max(0.0, self.volume - float(volume))
+        self._touched = True
 
-    def add_volume(self, volume: float) -> None:
+    def _add_volume(self, volume: float) -> None:
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume < 0:
+            raise ValueError(f"Dispense volume must be a non-negative number, got {volume!r}")
         if self.volume + volume > self.max_volume + VOLUME_TOLERANCE:
             raise ValueError(
                 f"Cannot dispense {volume} uL into {self}: would hold "
                 f"{self.volume + volume:.2f} uL, above well capacity {self.max_volume} uL"
             )
-        self.volume += volume
+        self.volume += float(volume)
+        self._touched = True
 
 
 class _MockLabware:
     def __init__(
         self,
         load_name: str,
-        slot: int,
+        slot: DeckSlot,
         spec: LabwareSpec,
         *,
         api_level: tuple[int, int] = (2, 16),
@@ -133,6 +190,16 @@ class _MockLabware:
         return [self._wells[w] for w in self.spec.wells]
 
 
+def _unwrap_well_target(location: Any, action: str) -> _MockWell:
+    if isinstance(location, _MockWell):
+        return location
+    if isinstance(location, _MockLocation):
+        return location.well
+    raise ValueError(
+        f"{action} target must be a labware well (got '{type(location).__name__}')"
+    )
+
+
 class _MockInstrumentContext:
     def __init__(
         self,
@@ -141,17 +208,21 @@ class _MockInstrumentContext:
         spec: PipetteSpec,
         tip_racks: list[_MockLabware],
         log: list[str],
-        fixed_trash: _MockTrash,
+        ctx: MockProtocolContext,
     ) -> None:
         self.model = model
         self.mount = mount
         self.spec = spec
         self.tip_racks = tip_racks
         self._log = log
-        self._fixed_trash = fixed_trash
+        self._ctx = ctx
+        self.flow_rate = _MockFlowRate()
         self.has_tip = False
         self.current_volume = 0.0
+        self._air_gap_volume = 0.0
         self.tips_used = 0
+        self._in_composite_op = False
+        self.max_op_volume_ul = 0.0
         if tip_racks:
             self.effective_max_volume = min(
                 [spec.max_volume] + [r.spec.max_volume for r in tip_racks]
@@ -163,7 +234,12 @@ class _MockInstrumentContext:
         if not self.has_tip:
             raise RuntimeError(f"Pipette '{self.model}' ({self.mount}) has no tip for {action}")
 
+    def _default_trash(self) -> _MockTrash:
+        return self._ctx._require_default_trash()
+
     def _check_vol(self, volume: float, action: str) -> None:
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)):
+            raise ValueError(f"{action} volume must be a number, got {volume!r}")
         if (
             volume < self.spec.min_volume - VOLUME_TOLERANCE
             or volume > self.effective_max_volume + VOLUME_TOLERANCE
@@ -173,77 +249,230 @@ class _MockInstrumentContext:
                 f"[{self.spec.min_volume}, {self.effective_max_volume}] uL"
             )
 
+    def _resolve_well_channels(
+        self, well: _MockWell, action: str
+    ) -> tuple[list[_MockWell], int]:
+        if isinstance(well.slot, str) and well.slot in FLEX_STAGING_SLOTS:
+            raise ValueError(
+                f"{action} cannot access labware on Flex staging slot '{well.slot}'"
+            )
+        channels = self.spec.channels
+        if channels == 1:
+            return [well], 1
+        lw = self._ctx._slots.get(well.slot)
+        if lw is None:
+            raise ValueError(f"{action} target well is not on an active deck labware")
+        row, col = lw.spec.well_grid[well.well_name]
+        if row != 0:
+            raise ValueError(
+                f"{action} with {channels}-channel pipette must target row 'A' column heads, "
+                f"got '{well.well_name}'"
+            )
+        col_entries = sorted(
+            (r, w_name) for w_name, (r, c) in lw.spec.well_grid.items() if c == col
+        )
+        if len(col_entries) == 1:
+            return [well], channels
+        if len(col_entries) == channels and [r for r, _ in col_entries] == list(range(channels)):
+            return [lw[w_name] for _, w_name in col_entries], 1
+        raise ValueError(
+            f"{action} with {channels}-channel pipette cannot address {len(col_entries)}-row "
+            f"labware '{lw.load_name}'"
+        )
+
     def pick_up_tip(self, location: _MockWell | None = None) -> None:
         if self.has_tip:
             raise RuntimeError(f"Pipette '{self.model}' ({self.mount}) already has a tip")
-        target: _MockWell | None = None
+        channels = self.spec.channels
+        if channels == 1:
+            target: _MockWell | None = None
+            if location is not None:
+                if not isinstance(location, _MockWell) or not location.has_tip:
+                    raise RuntimeError(f"No tip available at {location}")
+                target = location
+            else:
+                for rack in self.tip_racks:
+                    for well in rack.wells():
+                        if well.has_tip:
+                            target = well
+                            break
+                    if target is not None:
+                        break
+            if target is None:
+                raise RuntimeError(
+                    f"Out of tips for pipette '{self.model}' ({self.mount}) after {self.tips_used} tips"
+                )
+            target.has_tip = False
+            self.tips_used += 1
+            self.has_tip = True
+            self.current_volume = 0.0
+            self._air_gap_volume = 0.0
+            self._log.append(f"Picking up tip from {target}")
+            return
+
+        # 8-channel column pickup across rows A..H
+        col_wells: list[_MockWell] | None = None
         if location is not None:
-            if not location.has_tip:
+            if not isinstance(location, _MockWell):
                 raise RuntimeError(f"No tip available at {location}")
-            target = location
+            resolved, mult = self._resolve_well_channels(location, "pick_up_tip")
+            if mult != 1 or len(resolved) != channels or not all(w.has_tip for w in resolved):
+                raise RuntimeError(f"No full {channels}-tip column available at {location}")
+            col_wells = resolved
         else:
             for rack in self.tip_racks:
-                for well in rack.wells():
-                    if well.has_tip:
-                        target = well
-                        break
-                if target is not None:
+                max_col = max(c for _, c in rack.spec.well_grid.values())
+                for col in range(max_col + 1):
+                    entries = sorted(
+                        (r, w_name)
+                        for w_name, (r, c) in rack.spec.well_grid.items()
+                        if c == col
+                    )
+                    if len(entries) == channels:
+                        cand = [rack[w_name] for _, w_name in entries]
+                        if all(w.has_tip for w in cand):
+                            col_wells = cand
+                            break
+                if col_wells is not None:
                     break
-        if target is None:
+        if col_wells is None:
             raise RuntimeError(
                 f"Out of tips for pipette '{self.model}' ({self.mount}) after {self.tips_used} tips"
             )
-        target.has_tip = False
-        self.tips_used += 1
+        for w in col_wells:
+            w.has_tip = False
+        self.tips_used += channels
         self.has_tip = True
         self.current_volume = 0.0
-        self._log.append(f"Picking up tip from {target}")
+        self._air_gap_volume = 0.0
+        self._log.append(f"Picking up tip from {col_wells[0]}")
 
     def drop_tip(self) -> None:
         self._require_tip("drop_tip")
+        trash = self._default_trash()
         self.has_tip = False
         self.current_volume = 0.0
-        self._log.append(f"Dropping tip into {self._fixed_trash}")
+        self._air_gap_volume = 0.0
+        self._log.append(f"Dropping tip into {trash}")
 
     def aspirate(self, volume: float, location: Any) -> None:
         self._require_tip("aspirate")
         self._check_vol(volume, "aspirate")
-        if self.current_volume + volume > self.effective_max_volume + VOLUME_TOLERANCE:
+        vol = float(volume)
+        if self.current_volume + vol > self.effective_max_volume + VOLUME_TOLERANCE:
             raise ValueError(
                 f"Cannot aspirate {volume} uL: exceeds max volume {self.effective_max_volume} uL"
             )
-        if isinstance(location, _MockWell):
-            location.remove_volume(volume)
-        self.current_volume += volume
-        self._log.append(f"Aspirating {_fmt_log_vol(volume)} uL from {location}")
+        well = _unwrap_well_target(location, "aspirate")
+        if well.has_tip or (
+            well.slot in self._ctx._slots and self._ctx._slots[well.slot].spec.is_tiprack
+        ):
+            raise ValueError(f"Cannot aspirate liquid from tip rack well {well}")
+        affected, mult = self._resolve_well_channels(well, "aspirate")
+        for w in affected:
+            w._remove_volume(vol * mult)
+        if not self._in_composite_op:
+            self.max_op_volume_ul = max(self.max_op_volume_ul, vol)
+        self.current_volume += vol
+        self._log.append(f"Aspirating {_fmt_log_vol(vol)} uL from {location}")
+
+    def air_gap(self, volume: float = 0.0, height: float | None = None) -> None:
+        self._require_tip("air_gap")
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume < 0:
+            raise ValueError(f"air_gap volume must be a non-negative number, got {volume!r}")
+        if height is not None and (isinstance(height, bool) or not isinstance(height, (int, float))):
+            raise ValueError(f"air_gap height must be numeric, got {height!r}")
+        vol = float(volume)
+        if self.current_volume + vol > self.effective_max_volume + VOLUME_TOLERANCE:
+            raise ValueError(
+                f"Cannot air_gap {volume} uL: exceeds max volume {self.effective_max_volume} uL"
+            )
+        self.current_volume += vol
+        self._air_gap_volume += vol
+        self._log.append(f"Air gap {_fmt_log_vol(vol)} uL")
 
     def dispense(self, volume: float, location: Any) -> None:
         self._require_tip("dispense")
         self._check_vol(volume, "dispense")
-        if volume > self.current_volume + VOLUME_TOLERANCE:
+        vol = float(volume)
+        if vol > self.current_volume + VOLUME_TOLERANCE:
             raise ValueError(
                 f"Cannot dispense {volume} uL with {self.current_volume:.2f} uL aspirated"
             )
-        if isinstance(location, _MockWell):
-            location.add_volume(volume)
-        self.current_volume = max(0.0, self.current_volume - volume)
-        self._log.append(f"Dispensing {_fmt_log_vol(volume)} uL into {location}")
+        air_expelled = min(self._air_gap_volume, vol)
+        liquid_vol = max(0.0, vol - air_expelled)
+        if isinstance(location, _MockTrash):
+            pass
+        elif isinstance(location, (_MockWell, _MockLocation)):
+            well = _unwrap_well_target(location, "dispense")
+            if well.slot in self._ctx._slots and self._ctx._slots[well.slot].spec.is_tiprack:
+                raise ValueError(f"Cannot dispense liquid into tip rack well {well}")
+            affected, mult = self._resolve_well_channels(well, "dispense")
+            for w in affected:
+                w._add_volume(liquid_vol * mult)
+        else:
+            raise ValueError(
+                f"dispense target must be a well or trash container (got '{type(location).__name__}')"
+            )
+        if not self._in_composite_op:
+            self.max_op_volume_ul = max(self.max_op_volume_ul, liquid_vol)
+        self._air_gap_volume = max(0.0, self._air_gap_volume - air_expelled)
+        self.current_volume = max(0.0, self.current_volume - vol)
+        self._log.append(f"Dispensing {_fmt_log_vol(vol)} uL into {location}")
 
     def blow_out(self, location: Any = None) -> None:
         self._require_tip("blow_out")
+        if location is None:
+            target: Any = self._default_trash()
+        elif isinstance(location, (_MockWell, _MockLocation, _MockTrash)):
+            target = location
+        else:
+            raise ValueError(
+                f"blow_out target must be a well, location, or trash (got '{type(location).__name__}')"
+            )
         self.current_volume = 0.0
-        target = location if location is not None else self._fixed_trash
+        self._air_gap_volume = 0.0
         self._log.append(f"Blowing out into {target}")
+
+    def touch_tip(
+        self,
+        location: _MockWell | _MockLocation | None = None,
+        *,
+        radius: float = 1.0,
+        v_offset: float = -1.0,
+        speed: float = 60.0,
+    ) -> None:
+        self._require_tip("touch_tip")
+        if location is not None and not isinstance(location, (_MockWell, _MockLocation)):
+            raise ValueError(
+                f"touch_tip location must be a well or None (got '{type(location).__name__}')"
+            )
+        for val, name in ((radius, "radius"), (v_offset, "v_offset"), (speed, "speed")):
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ValueError(f"touch_tip {name} must be numeric, got {val!r}")
+        self._log.append(f"Touching tip at {location}" if location is not None else "Touching tip")
 
     def mix(self, repetitions: int, volume: float, location: Any) -> None:
         self._require_tip("mix")
         self._check_vol(volume, "mix")
-        if repetitions < 1:
+        if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 1:
             raise ValueError(f"mix repetitions must be >= 1, got {repetitions}")
-        self._log.append(f"Mixing {repetitions} times with {_fmt_log_vol(volume)} uL at {location}")
-        for _ in range(repetitions):
-            self.aspirate(volume, location)
-            self.dispense(volume, location)
+        _unwrap_well_target(location, "mix")
+        vol = float(volume)
+        outer = not self._in_composite_op
+        if outer:
+            self.max_op_volume_ul = max(self.max_op_volume_ul, vol)
+            self._in_composite_op = True
+        try:
+            self._log.append(
+                f"Mixing {repetitions} times with {_fmt_log_vol(vol)} uL at {location}"
+            )
+            for _ in range(repetitions):
+                self.aspirate(vol, location)
+                self.dispense(vol, location)
+        finally:
+            if outer:
+                self._in_composite_op = False
 
     def transfer(
         self,
@@ -256,10 +485,11 @@ class _MockInstrumentContext:
     ) -> None:
         if new_tip not in ("once", "always", "never"):
             raise ValueError(f"Invalid new_tip mode: {new_tip}")
-        if volume <= 0:
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume <= 0:
             raise ValueError(f"transfer volume must be positive, got {volume}")
-        strokes = max(1, math.ceil((volume - VOLUME_TOLERANCE) / self.effective_max_volume))
-        stroke_vol = volume / strokes
+        vol = float(volume)
+        strokes = max(1, math.ceil((vol - VOLUME_TOLERANCE) / self.effective_max_volume))
+        stroke_vol = vol / strokes
         self._check_vol(stroke_vol, "transfer")
 
         srcs = list(source) if isinstance(source, (list, tuple)) else [source]
@@ -271,6 +501,12 @@ class _MockInstrumentContext:
         elif len(srcs) != len(dsts):
             raise ValueError("Source and destination well counts do not match")
 
+        self.max_op_volume_ul = max(self.max_op_volume_ul, vol)
+        if mix_after is not None:
+            self.max_op_volume_ul = max(self.max_op_volume_ul, float(mix_after[1]))
+
+        prev_composite = self._in_composite_op
+        self._in_composite_op = True
         if new_tip == "once":
             self.pick_up_tip()
         try:
@@ -286,8 +522,11 @@ class _MockInstrumentContext:
                 if new_tip == "always":
                     self.drop_tip()
         finally:
-            if new_tip == "once" and self.has_tip:
-                self.drop_tip()
+            try:
+                if new_tip == "once" and self.has_tip:
+                    self.drop_tip()
+            finally:
+                self._in_composite_op = prev_composite
 
     def distribute(
         self,
@@ -302,47 +541,109 @@ class _MockInstrumentContext:
             raise ValueError(f"distribute supports 'once' or 'never', got {new_tip}")
         dsts = list(dest) if isinstance(dest, (list, tuple)) else [dest]
         self._check_vol(volume, "distribute")
+        vol = float(volume)
         disp_vol = self.spec.min_volume if disposal_volume is None else float(disposal_volume)
         if disp_vol < 0:
             raise ValueError(f"disposal_volume must be >= 0, got {disp_vol}")
-        if volume + disp_vol > self.effective_max_volume + VOLUME_TOLERANCE:
+        if vol + disp_vol > self.effective_max_volume + VOLUME_TOLERANCE:
             raise ValueError(
                 f"distribute volume {volume} uL + disposal_volume {disp_vol} uL "
                 f"exceeds max volume {self.effective_max_volume} uL"
             )
+        trash = self._default_trash()
+        self.max_op_volume_ul = max(self.max_op_volume_ul, vol)
+        prev_composite = self._in_composite_op
+        self._in_composite_op = True
         if new_tip == "once":
             self.pick_up_tip()
         try:
             idx = 0
             batch_count = max(
-                1, int((self.effective_max_volume - disp_vol + VOLUME_TOLERANCE) // volume)
+                1, int((self.effective_max_volume - disp_vol + VOLUME_TOLERANCE) // vol)
             )
             while idx < len(dsts):
                 chunk = dsts[idx : idx + batch_count]
-                self.aspirate(volume * len(chunk) + disp_vol, source)
+                self.aspirate(vol * len(chunk) + disp_vol, source)
                 for dst_well in chunk:
-                    self.dispense(volume, dst_well)
-                self.blow_out(self._fixed_trash)
+                    self.dispense(vol, dst_well)
+                self.blow_out(trash)
                 idx += len(chunk)
         finally:
-            if new_tip == "once" and self.has_tip:
-                self.drop_tip()
+            try:
+                if new_tip == "once" and self.has_tip:
+                    self.drop_tip()
+            finally:
+                self._in_composite_op = prev_composite
 
 
 class MockProtocolContext:
     """Minimal mock ProtocolContext used when opentrons is not installed."""
 
-    def __init__(self, *, api_level: tuple[int, int] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_level: tuple[int, int] | None = None,
+        robot_type: str = "OT-2",
+    ) -> None:
         self.api_level = parse_api_level(DEFAULT_API_LEVEL) if api_level is None else api_level
+        self.robot_type = robot_type
         self.log: list[str] = []
-        self.fixed_trash = _MockTrash()
-        self._slots: dict[int, _MockLabware] = {}
+        self._ot2_trash: _MockTrash | None = _MockTrash(12) if robot_type == "OT-2" else None
+        self._trash_bins: dict[DeckSlot, _MockTrash] = {}
+        self._slots: dict[DeckSlot, _MockLabware] = {}
+        self._slot_aliases: dict[DeckSlot, str] = {}
         self._mounts: dict[str, _MockInstrumentContext] = {}
 
-    def load_labware(self, load_name: str, slot: int) -> _MockLabware:
-        if isinstance(slot, bool) or not isinstance(slot, int) or not (1 <= slot <= 11):
-            raise ValueError(f"Invalid deck slot: {slot}")
-        if slot in self._slots:
+    @property
+    def fixed_trash(self) -> _MockTrash:
+        if self.robot_type == "Flex":
+            raise RuntimeError(
+                "protocol.fixed_trash is not supported on Opentrons Flex; "
+                f"call protocol.load_trash_bin({DEFAULT_FLEX_TRASH_SLOT!r})"
+            )
+        assert self._ot2_trash is not None
+        return self._ot2_trash
+
+    def _require_default_trash(self) -> _MockTrash:
+        if self._ot2_trash is not None:
+            return self._ot2_trash
+        if self._trash_bins:
+            first_slot = next(iter(self._trash_bins))
+            return self._trash_bins[first_slot]
+        raise RuntimeError(
+            "No trash container configured on Opentrons Flex; "
+            f"call protocol.load_trash_bin({DEFAULT_FLEX_TRASH_SLOT!r})"
+        )
+
+    def load_trash_bin(self, location: str = DEFAULT_FLEX_TRASH_SLOT) -> _MockTrash:
+        if self.robot_type != "Flex" and self.api_level < (2, 16):
+            raise RuntimeError("protocol.load_trash_bin requires apiLevel 2.16 or newer")
+        if self.robot_type == "Flex":
+            if not is_valid_flex_slot(location, allow_staging=False):
+                raise ValueError(
+                    f"Invalid Flex trash bin slot {location!r}: expected 'A1'..'D3'"
+                )
+            slot: DeckSlot = location
+        else:
+            if isinstance(location, bool) or not isinstance(location, int) or not (1 <= location <= 12):
+                raise ValueError(f"Invalid OT-2 trash bin slot: {location!r}")
+            slot = location
+        if slot in self._slots or slot in self._trash_bins:
+            raise ValueError(f"Slot {slot} already occupied")
+        tb = _MockTrash(slot)
+        self._trash_bins[slot] = tb
+        return tb
+
+    def load_labware(self, load_name: str, slot: DeckSlot) -> _MockLabware:
+        if self.robot_type == "Flex":
+            if not is_valid_flex_slot(slot, allow_staging=True):
+                raise ValueError(
+                    f"Invalid Flex deck slot {slot!r}: expected 'A1'..'D3' (or 'A4'..'D4')"
+                )
+        else:
+            if isinstance(slot, bool) or not isinstance(slot, int) or not (1 <= slot <= 11):
+                raise ValueError(f"Invalid deck slot: {slot}")
+        if slot in self._slots or slot in self._trash_bins:
             raise ValueError(f"Slot {slot} already occupied")
         spec = get_labware_spec(load_name)
         if spec is None:
@@ -364,12 +665,28 @@ class MockProtocolContext:
         spec = get_pipette_spec(model)
         if spec is None:
             raise ValueError(f"Unknown pipette model: {model}")
-        if spec.channels > 1:
-            raise ValueError(f"Multichannel pipette '{model}' is not supported in mock checker")
+        if self.robot_type == "Flex":
+            if not is_flex_pipette(model):
+                raise ValueError(
+                    f"OT-2 pipette '{model}' is not supported on Opentrons Flex"
+                )
+        else:
+            if is_flex_pipette(model):
+                raise ValueError(
+                    f"Opentrons Flex pipette '{model}' requires requirements['robotType'] == 'Flex'"
+                )
+            if spec.channels > 1:
+                raise ValueError(
+                    f"Multichannel pipette '{model}' is not supported in OT-2 mock checker"
+                )
         racks = list(tip_racks or [])
         for rack in racks:
-            if not rack.spec.is_tiprack:
-                raise ValueError(f"Labware '{rack.load_name}' is not a tip rack")
+            if not isinstance(rack, _MockLabware) or not rack.spec.is_tiprack:
+                raise ValueError(f"Labware '{getattr(rack, 'load_name', rack)}' is not a tip rack")
+            if isinstance(rack.slot, str) and rack.slot in FLEX_STAGING_SLOTS:
+                raise ValueError(
+                    f"Tip rack '{rack.load_name}' cannot be accessed in Flex staging slot '{rack.slot}'"
+                )
             if not is_tip_rack_compatible(spec, rack.spec):
                 raise ValueError(
                     f"Tip rack '{rack.load_name}' ({rack.spec.max_volume:g} uL) is incompatible "
@@ -381,7 +698,7 @@ class MockProtocolContext:
             spec=spec,
             tip_racks=racks,
             log=self.log,
-            fixed_trash=self.fixed_trash,
+            ctx=self,
         )
         self._mounts[mount] = inst
         return inst
@@ -403,7 +720,14 @@ class MockProtocolContext:
         self.log.append(f"Comment: {msg}")
 
     def delay(self, seconds: float = 0, minutes: float = 0) -> None:
-        if seconds < 0 or minutes < 0:
+        if (
+            isinstance(seconds, bool)
+            or isinstance(minutes, bool)
+            or not isinstance(seconds, (int, float))
+            or not isinstance(minutes, (int, float))
+            or seconds < 0
+            or minutes < 0
+        ):
             raise ValueError("delay seconds and minutes must be >= 0")
         total = float(seconds) + 60.0 * float(minutes)
         self.log.append(f"Delaying for {total:.1f} seconds")
@@ -416,23 +740,207 @@ _SAFE_OBJECT_TYPES = (
     MockProtocolContext,
     _MockLabware,
     _MockWell,
+    _MockLocation,
+    _MockFlowRate,
     _MockInstrumentContext,
     _MockTrash,
     _MockLiquid,
 )
+
+_ALLOWED_ATTRS: dict[type[Any], frozenset[str]] = {
+    MockProtocolContext: frozenset(
+        {
+            "fixed_trash",
+            "load_labware",
+            "load_trash_bin",
+            "load_instrument",
+            "define_liquid",
+            "comment",
+            "delay",
+            "pause",
+        }
+    ),
+    _MockLabware: frozenset({"wells"}),
+    _MockWell: frozenset({"load_liquid", "top", "bottom"}),
+    _MockLocation: frozenset(),
+    _MockFlowRate: frozenset({"aspirate", "dispense", "blow_out"}),
+    _MockInstrumentContext: frozenset(
+        {
+            "flow_rate",
+            "pick_up_tip",
+            "drop_tip",
+            "aspirate",
+            "air_gap",
+            "dispense",
+            "blow_out",
+            "touch_tip",
+            "mix",
+            "transfer",
+            "distribute",
+        }
+    ),
+    _MockTrash: frozenset(),
+    _MockLiquid: frozenset(),
+}
+
+_ALL_ALLOWED_ATTR_NAMES: frozenset[str] = frozenset().union(*_ALLOWED_ATTRS.values())
+_WRITABLE_FLOW_RATE_ATTRS: frozenset[str] = frozenset({"aspirate", "dispense", "blow_out"})
 
 
 class _ReturnSignal(Exception):
     """Internal control-flow signal for bare `return` inside `def run(protocol):`."""
 
 
+def _validate_safe_ast_stmt(stmt: ast.stmt) -> None:
+    """Statically verify an AST statement inside `run(protocol)` before execution."""
+    if isinstance(stmt, ast.Pass):
+        return
+    if isinstance(stmt, ast.Return):
+        if stmt.value is not None and not (
+            isinstance(stmt.value, ast.Constant) and stmt.value.value is None
+        ):
+            raise ValueError(f"run() must not return a value (line {stmt.lineno})")
+        return
+    if isinstance(stmt, ast.Expr):
+        _validate_safe_ast_expr(stmt.value)
+        return
+    if isinstance(stmt, ast.Assign):
+        _validate_safe_ast_expr(stmt.value)
+        for target in stmt.targets:
+            _validate_safe_ast_target(target)
+        return
+    if isinstance(stmt, ast.AnnAssign):
+        if stmt.value is not None:
+            _validate_safe_ast_expr(stmt.value)
+            _validate_safe_ast_target(stmt.target)
+        return
+    if isinstance(stmt, ast.For):
+        if stmt.orelse:
+            raise ValueError(f"'for ... else' is not supported (line {stmt.lineno})")
+        _validate_safe_ast_target(stmt.target, allow_attr=False)
+        _validate_safe_ast_expr(stmt.iter)
+        for inner in stmt.body:
+            _validate_safe_ast_stmt(inner)
+        return
+    raise ValueError(
+        f"Unsupported or unsafe statement '{type(stmt).__name__}' in protocol check "
+        f"(line {stmt.lineno})"
+    )
+
+
+def _validate_safe_ast_target(target: ast.expr, *, allow_attr: bool = True) -> None:
+    if isinstance(target, ast.Name):
+        if target.id.startswith("_"):
+            raise ValueError(f"Disallowed private/dunder identifier '{target.id}'")
+        return
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _validate_safe_ast_target(elt, allow_attr=False)
+        return
+    if allow_attr and isinstance(target, ast.Attribute):
+        if target.attr.startswith("_") or target.attr not in _WRITABLE_FLOW_RATE_ATTRS:
+            raise ValueError(
+                f"Unsupported attribute assignment '.{target.attr}' at line {target.lineno}"
+            )
+        _validate_safe_ast_expr(target.value)
+        return
+    raise ValueError(
+        f"Unsupported assignment target '{type(target).__name__}' at line {target.lineno}"
+    )
+
+
+def _validate_safe_ast_expr(expr: ast.expr) -> None:
+    if isinstance(expr, ast.Constant):
+        if isinstance(expr.value, (str, int, float, bool)) or expr.value is None:
+            return
+        raise ValueError(f"Unsupported constant type at line {expr.lineno}")
+    if isinstance(expr, ast.Name):
+        if expr.id.startswith("_"):
+            raise ValueError(
+                f"Disallowed private/dunder name '{expr.id}' at line {expr.lineno}"
+            )
+        return
+    if isinstance(expr, (ast.List, ast.Tuple)):
+        for elt in expr.elts:
+            _validate_safe_ast_expr(elt)
+        return
+    if isinstance(expr, ast.Dict):
+        for k_node, v_node in zip(expr.keys, expr.values):
+            if k_node is None:
+                raise ValueError(f"Dict unpacking is not supported (line {expr.lineno})")
+            _validate_safe_ast_expr(k_node)
+            _validate_safe_ast_expr(v_node)
+        return
+    if isinstance(expr, ast.UnaryOp):
+        if not isinstance(expr.op, (ast.UAdd, ast.USub)):
+            raise ValueError(f"Unsupported unary operator at line {expr.lineno}")
+        _validate_safe_ast_expr(expr.operand)
+        return
+    if isinstance(expr, ast.BinOp):
+        if not isinstance(expr.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)):
+            raise ValueError(f"Unsupported binary operator at line {expr.lineno}")
+        _validate_safe_ast_expr(expr.left)
+        _validate_safe_ast_expr(expr.right)
+        return
+    if isinstance(expr, ast.Subscript):
+        _validate_safe_ast_expr(expr.value)
+        if isinstance(expr.slice, ast.Slice):
+            if expr.slice.lower is not None:
+                _validate_safe_ast_expr(expr.slice.lower)
+            if expr.slice.upper is not None:
+                _validate_safe_ast_expr(expr.slice.upper)
+            if expr.slice.step is not None:
+                _validate_safe_ast_expr(expr.slice.step)
+        else:
+            _validate_safe_ast_expr(expr.slice)
+        return
+    if isinstance(expr, ast.Attribute):
+        if expr.attr.startswith("_"):
+            raise ValueError(
+                f"Disallowed private/dunder attribute '{expr.attr}' at line {expr.lineno}"
+            )
+        if expr.attr not in _ALL_ALLOWED_ATTR_NAMES:
+            raise ValueError(
+                f"Disallowed or unknown Opentrons attribute '{expr.attr}' at line {expr.lineno}"
+            )
+        _validate_safe_ast_expr(expr.value)
+        return
+    if isinstance(expr, ast.Call):
+        if not isinstance(expr.func, ast.Attribute):
+            func_desc = (
+                expr.func.id if isinstance(expr.func, ast.Name) else type(expr.func).__name__
+            )
+            raise ValueError(
+                f"Disallowed direct function call '{func_desc}' in protocol check "
+                f"(line {expr.lineno})"
+            )
+        _validate_safe_ast_expr(expr.func)
+        for arg in expr.args:
+            if isinstance(arg, ast.Starred):
+                _validate_safe_ast_expr(arg.value)
+            else:
+                _validate_safe_ast_expr(arg)
+        for kw in expr.keywords:
+            if kw.arg is None or kw.arg.startswith("_"):
+                raise ValueError(f"Unsupported keyword argument at line {expr.lineno}")
+            _validate_safe_ast_expr(kw.value)
+        return
+    raise ValueError(
+        f"Unsupported or unsafe expression '{type(expr).__name__}' in protocol check "
+        f"(line {expr.lineno})"
+    )
+
+
 class _SafeProtocolInterpreter:
     """Restricted AST interpreter for Opentrons Python API v2 protocols (no exec/eval)."""
 
     def __init__(self, ctx: MockProtocolContext, param_name: str) -> None:
+        self.ctx = ctx
         self.env: dict[str, Any] = {param_name: ctx}
 
     def run_body(self, stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            _validate_safe_ast_stmt(stmt)
         try:
             for stmt in stmts:
                 self._exec_stmt(stmt)
@@ -444,6 +952,8 @@ class _SafeProtocolInterpreter:
             if target.id.startswith("_"):
                 raise ValueError(f"Disallowed private/dunder identifier '{target.id}'")
             self.env[target.id] = value
+            if isinstance(value, _MockLabware) and value.slot not in self.ctx._slot_aliases:
+                self.ctx._slot_aliases[value.slot] = target.id
             return
         if isinstance(target, (ast.Tuple, ast.List)):
             if not isinstance(value, (tuple, list)) or len(value) != len(target.elts):
@@ -451,6 +961,24 @@ class _SafeProtocolInterpreter:
             for elt, item in zip(target.elts, value):
                 self._bind_target(elt, item)
             return
+        if isinstance(target, ast.Attribute):
+            owner = self._eval_expr(target.value)
+            if isinstance(owner, _MockFlowRate) and target.attr in _WRITABLE_FLOW_RATE_ATTRS:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0.0
+                ):
+                    raise ValueError(
+                        f"flow_rate.{target.attr} must be a positive finite number, got {value!r}"
+                    )
+                setattr(owner, target.attr, float(value))
+                return
+            raise ValueError(
+                f"Attribute assignment '.{target.attr}' not allowed on '{type(owner).__name__}' "
+                f"at line {target.lineno}"
+            )
         raise ValueError(
             f"Unsupported assignment target '{type(target).__name__}' at line {target.lineno}"
         )
@@ -597,9 +1125,11 @@ class _SafeProtocolInterpreter:
                     f"Attribute access '{expr.attr}' not allowed on '{type(owner).__name__}' "
                     f"(line {expr.lineno})"
                 )
-            if not hasattr(owner, expr.attr):
-                raise AttributeError(
-                    f"'{type(owner).__name__}' has no attribute '{expr.attr}'"
+            allowed = _ALLOWED_ATTRS.get(type(owner), frozenset())
+            if expr.attr not in allowed:
+                raise ValueError(
+                    f"Attribute or method '{expr.attr}' is not allowed on '{type(owner).__name__}' "
+                    f"(line {expr.lineno})"
                 )
             return getattr(owner, expr.attr)
 
@@ -617,6 +1147,12 @@ class _SafeProtocolInterpreter:
             if not callable(callee) or not isinstance(self_obj, _SAFE_OBJECT_TYPES):
                 raise ValueError(
                     f"Call target is not a bound Opentrons protocol method (line {expr.lineno})"
+                )
+            allowed_methods = _ALLOWED_ATTRS.get(type(self_obj), frozenset())
+            if expr.func.attr not in allowed_methods:
+                raise ValueError(
+                    f"Method '{expr.func.attr}' is not allowed on '{type(self_obj).__name__}' "
+                    f"(line {expr.lineno})"
                 )
             pos_args: list[Any] = []
             for arg in expr.args:
@@ -661,29 +1197,41 @@ def _validate_api_level_format(api_level: Any) -> tuple[tuple[int, int] | None, 
 
 
 def _read_api_level(source: str) -> Any:
-    """Return metadata['apiLevel'] from protocol source without executing it."""
+    """Return apiLevel from top-level `requirements` or `metadata` without executing `source`."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
+    meta_level: Any = None
+    req_level: Any = None
+    has_meta = False
+    has_req = False
     for node in tree.body:
-        if (
-            isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "metadata" for t in node.targets)
-        ):
-            try:
-                metadata = ast.literal_eval(node.value)
-            except ValueError:
-                return None
-            if isinstance(metadata, dict) and "apiLevel" in metadata:
-                return metadata["apiLevel"]
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id in ("metadata", "requirements"):
+                    try:
+                        lit = ast.literal_eval(node.value)
+                    except ValueError:
+                        continue
+                    if isinstance(lit, dict) and "apiLevel" in lit:
+                        if t.id == "requirements":
+                            has_req = True
+                            req_level = lit["apiLevel"]
+                        else:
+                            has_meta = True
+                            meta_level = lit["apiLevel"]
+    if has_req:
+        return req_level
+    if has_meta:
+        return meta_level
     return None
 
 
 def api_level_error(api_level: Any, max_supported: tuple[int, int]) -> str | None:
     """Return an error message if api_level is malformed or newer than max_supported."""
     if api_level is None:
-        return "Protocol metadata has no string 'apiLevel'"
+        return "Protocol metadata/requirements has no string 'apiLevel'"
     requested, fmt_err = _validate_api_level_format(api_level)
     if fmt_err is not None or requested is None:
         return fmt_err
@@ -696,9 +1244,25 @@ def api_level_error(api_level: Any, max_supported: tuple[int, int]) -> str | Non
     return None
 
 
-def _parse_safe_protocol_ast(source: str, filename: str) -> tuple[dict[str, Any], ast.FunctionDef]:
+def _resolve_ast_robot_type(requirements: dict[str, Any] | None) -> str:
+    if requirements is None or "robotType" not in requirements:
+        return "OT-2"
+    raw = requirements["robotType"]
+    if raw in ("OT-2", "OT2"):
+        return "OT-2"
+    if raw in ("Flex", "OT-3"):
+        return "Flex"
+    raise ValueError(
+        f"Unsupported requirements['robotType'] {raw!r}: expected 'OT-2' or 'Flex'"
+    )
+
+
+def _parse_safe_protocol_ast(
+    source: str, filename: str
+) -> tuple[dict[str, Any], ast.FunctionDef]:
     tree = ast.parse(source, filename=filename)
     metadata: dict[str, Any] | None = None
+    requirements: dict[str, Any] | None = None
     run_def: ast.FunctionDef | None = None
 
     for node in tree.body:
@@ -721,6 +1285,8 @@ def _parse_safe_protocol_ast(source: str, filename: str) -> tuple[dict[str, Any]
                     raise ValueError(f"'{name}' must be a dictionary")
                 if name == "metadata":
                     metadata = lit
+                else:
+                    requirements = lit
                 continue
         if isinstance(node, ast.FunctionDef) and node.name == "run":
             if node.decorator_list:
@@ -731,18 +1297,53 @@ def _parse_safe_protocol_ast(source: str, filename: str) -> tuple[dict[str, Any]
             continue
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             raise ValueError(
-                f"Import statements are disallowed in mock check (line {node.lineno})"
+                f"Import statements are disallowed in protocol check (line {node.lineno})"
             )
         raise ValueError(
-            f"Unsupported top-level statement '{type(node).__name__}' in mock check "
+            f"Unsupported top-level statement '{type(node).__name__}' in protocol check "
             f"(line {node.lineno})"
         )
 
-    if metadata is None or "apiLevel" not in metadata:
-        raise ValueError("Protocol missing metadata['apiLevel']")
+    has_meta_api = metadata is not None and "apiLevel" in metadata
+    has_req_api = requirements is not None and "apiLevel" in requirements
+    if has_meta_api and has_req_api:
+        raise ValueError("Protocol cannot specify 'apiLevel' in both metadata and requirements")
+    if not has_meta_api and not has_req_api:
+        raise ValueError("Protocol missing metadata['apiLevel'] or requirements['apiLevel']")
     if run_def is None:
         raise ValueError("Protocol missing callable run(protocol)")
-    return metadata, run_def
+
+    for stmt in run_def.body:
+        _validate_safe_ast_stmt(stmt)
+
+    robot_type = _resolve_ast_robot_type(requirements)
+    eff_meta: dict[str, Any] = dict(metadata or {})
+    if has_req_api and requirements is not None:
+        eff_meta["apiLevel"] = requirements["apiLevel"]
+    eff_meta["_resolved_robot_type"] = robot_type
+    return eff_meta, run_def
+
+
+def _extract_mock_telemetry(
+    ctx: MockProtocolContext,
+) -> tuple[tuple[DeckSlot, ...], float, dict[str, float], dict[str, int]]:
+    loaded_slots = tuple(sorted(ctx._slots.keys(), key=deck_slot_sort_key))
+    max_op = 0.0
+    tips_by_mount: dict[str, int] = {}
+    for mount, inst in sorted(ctx._mounts.items()):
+        max_op = max(max_op, inst.max_op_volume_ul)
+        tips_by_mount[mount] = inst.tips_used
+
+    well_volumes: dict[str, float] = {}
+    for slot in loaded_slots:
+        lw = ctx._slots[slot]
+        if lw.spec.is_tiprack:
+            continue
+        alias = ctx._slot_aliases.get(slot, f"slot_{slot}")
+        for well in lw.wells():
+            if well._touched or well.volume > 0.0:
+                well_volumes[f"{alias}:{well.well_name}"] = round(well.volume, 4)
+    return loaded_slots, round(max_op, 4), well_volumes, tips_by_mount
 
 
 def _check_with_opentrons(path: Path) -> CheckResult | None:
@@ -752,9 +1353,14 @@ def _check_with_opentrons(path: Path) -> CheckResult | None:
         return None
     try:
         raw_source = path.read_text(encoding="utf-8")
+        # Security pre-gate (#29): enforce safe AST parse & statement allowlist BEFORE opentrons.simulate
+        eff_meta, _ = _parse_safe_protocol_ast(raw_source, str(path))
+        raw_api_level = eff_meta.get("apiLevel")
+        robot_type = str(eff_meta.get("_resolved_robot_type", "OT-2"))
+
         max_supported = installed_max_api_level()
         if max_supported is not None:
-            error = api_level_error(_read_api_level(raw_source), max_supported)
+            error = api_level_error(raw_api_level, max_supported)
             if error is not None:
                 return CheckResult(
                     backend="opentrons",
@@ -763,7 +1369,12 @@ def _check_with_opentrons(path: Path) -> CheckResult | None:
                     line_count=0,
                     lines=(),
                     errors=(error,),
+                    api_level=raw_api_level if isinstance(raw_api_level, str) else None,
+                    robot_type=robot_type,
                 )
+
+        # Also extract deterministic slot/volume/tip telemetry via safe AST mock
+        mock_probe = _check_source_with_mock(raw_source, str(path))
         with path.open("r", encoding="utf-8") as handle:
             runlog, _ = ot_simulate.simulate(handle, file_name=str(path))
         formatted = ot_simulate.format_runlog(runlog)
@@ -774,6 +1385,12 @@ def _check_with_opentrons(path: Path) -> CheckResult | None:
             command_count=len(runlog),
             line_count=len(lines),
             lines=lines,
+            api_level=mock_probe.api_level or (str(raw_api_level) if isinstance(raw_api_level, str) else None),
+            robot_type=robot_type,
+            loaded_slots=mock_probe.loaded_slots,
+            max_op_volume_ul=mock_probe.max_op_volume_ul,
+            well_volumes_ul=mock_probe.well_volumes_ul,
+            tips_used_per_mount=mock_probe.tips_used_per_mount,
         )
     except Exception as exc:
         return CheckResult(
@@ -788,21 +1405,35 @@ def _check_with_opentrons(path: Path) -> CheckResult | None:
 
 def _check_source_with_mock(source: str, filename: str = "<protocol>") -> CheckResult:
     try:
-        metadata, run_def = _parse_safe_protocol_ast(source, filename)
-        parsed_level, fmt_err = _validate_api_level_format(metadata.get("apiLevel"))
+        eff_meta, run_def = _parse_safe_protocol_ast(source, filename)
+        raw_level = eff_meta.get("apiLevel")
+        robot_type = str(eff_meta.get("_resolved_robot_type", "OT-2"))
+        parsed_level, fmt_err = _validate_api_level_format(raw_level)
         if fmt_err is not None or parsed_level is None:
             raise ValueError(fmt_err or "Invalid metadata['apiLevel']")
-        ctx = MockProtocolContext(api_level=parsed_level)
+        if robot_type == "Flex" and parsed_level < _MIN_FLEX_API_LEVEL:
+            raise ValueError(
+                f"Opentrons Flex requires apiLevel {_MIN_FLEX_API_LEVEL[0]}.{_MIN_FLEX_API_LEVEL[1]} "
+                f"or newer, got '{raw_level}'"
+            )
+        ctx = MockProtocolContext(api_level=parsed_level, robot_type=robot_type)
         param_name = run_def.args.args[0].arg
         interpreter = _SafeProtocolInterpreter(ctx, param_name)
         interpreter.run_body(run_def.body)
         lines = tuple(ctx.log)
+        loaded_slots, max_op, well_volumes, tips_by_mount = _extract_mock_telemetry(ctx)
         return CheckResult(
             backend="mock",
             ok=True,
             command_count=len(lines),
             line_count=len(lines),
             lines=lines,
+            api_level=f"{parsed_level[0]}.{parsed_level[1]}",
+            robot_type=robot_type,
+            loaded_slots=loaded_slots,
+            max_op_volume_ul=max_op,
+            well_volumes_ul=well_volumes,
+            tips_used_per_mount=tips_by_mount,
         )
     except Exception as exc:
         return CheckResult(

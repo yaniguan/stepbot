@@ -21,8 +21,8 @@
 
 ### Scope Boundaries
 
-- **Supported**: Opentrons OT-2 `11`-slot deck (`1..11` plus fixed trash on slot `12`); `24` built-in labware specs (with dynamic fallback to `opentrons_shared_data` when installed); single-channel Gen1/Gen2 pipettes; `transfer`, `distribute`, `mix`, `dilution_series` macro expansion, `delay`, `pause`, and `comment`.
-- **Out of scope / explicitly rejected**: Hardware modules (thermocycler, heater-shaker, temperature, magnetic), custom labware JSON files, Opentrons Flex alphanumeric deck slots (`A1..D3`), and 8-channelpipette column semantics (explicitly rejected at compile time on `origin/review-fixes`).
+- **Supported**: Opentrons OT-2 `11`-slot deck (`1..11` plus fixed trash on slot `12`) and Opentrons Flex alphanumeric coordinate deck (`A1..D3` plus staging `A4..D4` and configurable `load_trash_bin('A3')` in `apiLevel` `2.18`--`2.20`); `30` built-in labware specs (with dynamic fallback to `opentrons_shared_data` when installed); OT-2 single-channel Gen1/Gen2 pipettes and Flex 1-/8-channel pipettes (`flex_1channel_50/1000`, `flex_8channel_50/1000`); `transfer`, `distribute`, `mix`, `discard`, `dilution_series` macro expansion, `delay`, `pause`, `comment`, crash-safe `lean-mcp/v1` state persistence, and hardware-optional `:31950` HTTP Run API v2 execution (`OpentronsHttpRunAdapter`, verified locally via loopback `ThreadingHTTPServer`).
+- **Out of scope / explicitly rejected**: Hardware modules (thermocycler, heater-shaker, temperature, magnetic), custom labware JSON files, and legacy OT-2 multichannel pipettes (`p*_multi*`).
 
 ---
 
@@ -145,6 +145,20 @@
 
 ### Ecosystem Interfaces Across Auto-Lab
 
-- **Upstream from `L2` (`lab-ears`), `L3` (`YLM`), & `twinstep`**: Receives structured volumes, delays, and step sequences extracted from prose by [`lab-ears`](https://github.com/yaniguan/lab-ears), synthesized by [`YLM`](https://github.com/yaniguan/YLM), or stress-tested via seeded error twins in [`twinstep`](https://github.com/yaniguan/twinstep).
-- **Sibling `L1` (`lab-hands`) & Orchestration (`labshift`)**: Complements [`lab-hands`](https://github.com/yaniguan/lab-hands) (articulated-arm collision-free motion & visuo-tactile vessel handling) and [`labshift`](https://github.com/yaniguan/labshift) (CP-SAT multi-instrument job scheduling across shared liquid handlers and readers).
-- **Downstream / Gatekeeping with `L4` (`lab-rehearsal`, `lab-verify`)**: Acts as the concrete Opentrons code generator and static/mock verifier behind [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal)'s recall-rehearse-verify-run digital-twin loop and [`lab-verify`](https://github.com/yaniguan/lab-verify)'s default-deny protocol gate.
+- **Upstream from `L2` (`lab-ears`), `L5` (`labshift`), & `L4` (`lab-rehearsal`, `lab-verify`)**: Receives structured volumes and delays extracted from prose by [`lab-ears`](https://github.com/yaniguan/lab-ears), multi-instrument window schedules from [`labshift`](https://github.com/yaniguan/labshift), rehearsed 96-well protocol specs from [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), and co-signed `lean-mcp/v1` capability envelopes from [`lab-verify`](https://github.com/yaniguan/lab-verify).
+- **Sibling `L1` (`lab-hands`) & Edge `L0` (`lab-feet`)**: Complements [`lab-hands`](https://github.com/yaniguan/lab-hands) (collision-free 2-link SBS 96-well kinematics & visuo-tactile vessel handling) and feeds execution state into [`lab-feet`](https://github.com/yaniguan/lab-feet) (`L0` INT8/4-bit bench-side monitoring).
+- **Downstream Post-Run Telemetry (`stepbot -> lab-attrib -> twinstep, labfill, labbench-posttrain, lab-decide`)**: Emits `stepbot_execution` receipts and monotonic `deck_epoch` transitions downstream to [`lab-attrib`](https://github.com/yaniguan/lab-attrib) (`L4` post-execution causal blame, NNLS XRD precursor deconvolution, EVOI orthogonal modality routing, and SHA-256 certified ledger), ensuring robotic dispense or aspiration faults (`EXECUTION_ARTIFACT`) are quarantined before training updates in [`twinstep`](https://github.com/yaniguan/twinstep), [`labfill`](https://github.com/yaniguan/labfill), [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain), and [`lab-decide`](https://github.com/yaniguan/lab-decide).
+
+---
+
+## 7. 15-Repository Auto-Lab Wire Contract (`autolab-wire/v1`)
+
+`autolab_wire.py` (`REPO_ID = "stepbot"`, `LAYER = "L1"`) implements the `L1` Opentrons compilation and `lean-mcp/v1` hardware execution node across the 15-repository Auto-Lab stack (`lab-ears`, `lab-ask-why`, `lab-decide`, `lab-automation-atlas`, `buy-or-make`, `labshift`, `lab-rehearsal`, `lab-verify`, `stepbot`, `lab-hands`, `lab-feet`, `lab-attrib`, `twinstep`, `labfill`, `labbench-posttrain`):
+
+1. **`compile_stage(packet: dict) -> dict`**:
+   - Resolves repository paths strictly via `REPO_DIR = Path(__file__).resolve().parent` (never `os.getcwd()`), initializes `autolab-wire/v1` defaults on a deep copy, and returns halted packets unchanged.
+   - Compiles `packet["rehearsal"]["protocol_yaml_dict"]` (accepting both native `stepbot` specs and `lab-rehearsal` slot-keyed protocol dicts) or falls back to `REPO_DIR / "examples" / "plate_fill.yaml"` via `compile_with_mcp_envelope`, writing `out["stepbot_compiled"] = {"python_code", "protocol_sha256", "envelope_bounds", "self_envelope"}`.
+2. **`process_packet(packet: dict) -> dict`**:
+   - Ensures `stepbot_compiled` is populated, selects `verification.mcp_envelope` from [`lab-verify`](https://github.com/yaniguan/lab-verify) when `protocol_sha256` matches the compiled Python digest (falling back to `self_envelope`, or honoring `force_envelope` for security fault-injection tests), and dispatches through `StepbotMcpExecutor(..., use_mock=True).dispatch(..., simulate=True)`.
+   - Converts any `McpSecurityViolation` into `halted = True` and `halt_reason = f"L1_MCP_BLOCK:{exc.rule}"`.
+   - On verified execution, writes `out["stepbot_execution"]` (`python_code`, `protocol_sha256`, `mcp_envelope`, `dispatch_receipt`, `next_deck_epoch`), increments `out["deck_epoch"]`, and appends `stepbot`'s `L1` audit record (`invariant = "mcp_payload_and_epoch_binding"`) for downstream consumption by [`lab-feet`](https://github.com/yaniguan/lab-feet) and [`lab-attrib`](https://github.com/yaniguan/lab-attrib).
