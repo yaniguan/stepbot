@@ -650,7 +650,7 @@ def test_issue_20_multi_aspirate_transfer_and_discard_strokes(tmp_path: Path) ->
         ],
     )
     spec = parse_and_validate(proto)
-    assert spec.tips_used_per_rack["tips"] == 2
+    assert spec.tips_used_per_rack["tips"] == 4
     py_path = tmp_path / "multi_carry.py"
     py_path.write_text(compile_protocol(proto), encoding="utf-8")
     res = check_protocol(py_path, use_mock=True)

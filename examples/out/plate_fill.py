@@ -25,7 +25,7 @@ def run(protocol):
     pipette_left.distribute(150, reservoir["A1"], [plate["A1"], plate["A2"], plate["A3"], plate["A4"], plate["A5"], plate["A6"], plate["A7"], plate["A8"]], new_tip='once')
     protocol.comment('Add dye to A1-A4 and water blanks to A5-A8')
     pipette_left.transfer(50, reservoir["A2"], [plate["A1"], plate["A2"], plate["A3"], plate["A4"]], new_tip='always')
-    pipette_left.transfer(50, reservoir["A3"], [plate["A5"], plate["A6"], plate["A7"], plate["A8"]], new_tip='once')
+    pipette_left.transfer(50, reservoir["A3"], [plate["A5"].top(), plate["A6"].top(), plate["A7"].top(), plate["A8"].top()], new_tip='once')
     pipette_left.pick_up_tip()
     pipette_left.mix(3, 100, plate["A1"])
     pipette_left.drop_tip()

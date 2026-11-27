@@ -276,6 +276,7 @@ def compute_envelope_hmac(
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
+        allow_nan=False,
     ).encode("utf-8")
     return hmac.new(secret_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
 

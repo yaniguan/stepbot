@@ -1,11 +1,12 @@
-"""Built-in catalog of standard Opentrons labware and pipettes."""
+"""Built-in catalog of standard Opentrons labware, pipettes, and liquid-class rheology."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Any
 
-from stepbot.models import DeckSlot, LabwareSpec, PipetteSpec
+from stepbot.models import DeckSlot, LabwareSpec, PipetteConfig, PipetteSpec, RheologySpec
 
 
 def row_index_to_label(row: int) -> str:
@@ -27,6 +28,7 @@ def _grid_spec(
     max_volume: float,
     *,
     is_tiprack: bool = False,
+    touch_tip_disabled: bool = False,
 ) -> LabwareSpec:
     wells: list[str] = []
     well_grid: dict[str, tuple[int, int]] = {}
@@ -44,6 +46,7 @@ def _grid_spec(
         max_volume=max_volume,
         is_tiprack=is_tiprack,
         well_volumes=well_volumes,
+        touch_tip_disabled=touch_tip_disabled,
     )
 
 
@@ -82,10 +85,10 @@ LABWARE_CATALOG: dict[str, LabwareSpec] = {
         _grid_spec("nest_96_wellplate_200ul_flat", 8, 12, 200.0),
         _grid_spec("nest_96_wellplate_100ul_pcr_full_skirt", 8, 12, 100.0),
         _grid_spec("nest_96_wellplate_2ml_deep", 8, 12, 2000.0),
-        _grid_spec("nest_12_reservoir_15ml", 1, 12, 15000.0),
-        _grid_spec("nest_1_reservoir_195ml", 1, 1, 195000.0),
-        _grid_spec("usascientific_12_reservoir_22ml", 1, 12, 22000.0),
-        _grid_spec("agilent_1_reservoir_290ml", 1, 1, 290000.0),
+        _grid_spec("nest_12_reservoir_15ml", 1, 12, 15000.0, touch_tip_disabled=True),
+        _grid_spec("nest_1_reservoir_195ml", 1, 1, 195000.0, touch_tip_disabled=True),
+        _grid_spec("usascientific_12_reservoir_22ml", 1, 12, 22000.0, touch_tip_disabled=True),
+        _grid_spec("agilent_1_reservoir_290ml", 1, 1, 290000.0, touch_tip_disabled=True),
         _grid_spec("opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap", 4, 6, 1500.0),
         _grid_spec("opentrons_24_tuberack_nest_1.5ml_snapcap", 4, 6, 1500.0),
         _grid_spec("opentrons_15_tuberack_falcon_15ml_conical", 3, 5, 15000.0),
@@ -111,24 +114,154 @@ LABWARE_CATALOG: dict[str, LabwareSpec] = {
 PIPETTE_CATALOG: dict[str, PipetteSpec] = {
     spec.model: spec
     for spec in [
-        PipetteSpec("p10_single", 1.0, 10.0, 1),
-        PipetteSpec("p10_multi", 1.0, 10.0, 8),
-        PipetteSpec("p20_single_gen2", 1.0, 20.0, 1),
-        PipetteSpec("p20_multi_gen2", 1.0, 20.0, 8),
-        PipetteSpec("p50_single", 5.0, 50.0, 1),
-        PipetteSpec("p50_multi", 5.0, 50.0, 8),
-        PipetteSpec("p300_single", 30.0, 300.0, 1),
-        PipetteSpec("p300_multi", 30.0, 300.0, 8),
-        PipetteSpec("p300_single_gen2", 20.0, 300.0, 1),
-        PipetteSpec("p300_multi_gen2", 20.0, 300.0, 8),
-        PipetteSpec("p1000_single", 100.0, 1000.0, 1),
-        PipetteSpec("p1000_single_gen2", 100.0, 1000.0, 1),
-        PipetteSpec("flex_1channel_50", 1.0, 50.0, 1),
-        PipetteSpec("flex_1channel_1000", 5.0, 1000.0, 1),
-        PipetteSpec("flex_8channel_50", 1.0, 50.0, 8),
-        PipetteSpec("flex_8channel_1000", 5.0, 1000.0, 8),
+        PipetteSpec("p10_single", 1.0, 10.0, 1, 5.0, 10.0, 1000.0),
+        PipetteSpec("p10_multi", 1.0, 10.0, 8, 5.0, 10.0, 1000.0),
+        PipetteSpec("p20_single_gen2", 1.0, 20.0, 1, 7.56, 7.56, 7.56),
+        PipetteSpec("p20_multi_gen2", 1.0, 20.0, 8, 7.6, 7.6, 7.6),
+        PipetteSpec("p50_single", 5.0, 50.0, 1, 25.0, 50.0, 1000.0),
+        PipetteSpec("p50_multi", 5.0, 50.0, 8, 25.0, 50.0, 1000.0),
+        PipetteSpec("p300_single", 30.0, 300.0, 1, 150.0, 300.0, 1000.0),
+        PipetteSpec("p300_multi", 30.0, 300.0, 8, 150.0, 300.0, 1000.0),
+        PipetteSpec("p300_single_gen2", 20.0, 300.0, 1, 92.86, 92.86, 92.86),
+        PipetteSpec("p300_multi_gen2", 20.0, 300.0, 8, 94.0, 94.0, 94.0),
+        PipetteSpec("p1000_single", 100.0, 1000.0, 1, 500.0, 1000.0, 1000.0),
+        PipetteSpec("p1000_single_gen2", 100.0, 1000.0, 1, 274.7, 274.7, 274.7),
+        PipetteSpec("flex_1channel_50", 5.0, 50.0, 1, 35.0, 57.0, 57.0),
+        PipetteSpec("flex_1channel_1000", 5.0, 1000.0, 1, 716.0, 716.0, 716.0),
+        PipetteSpec("flex_8channel_50", 5.0, 50.0, 8, 35.0, 57.0, 57.0),
+        PipetteSpec("flex_8channel_1000", 5.0, 1000.0, 8, 716.0, 716.0, 716.0),
     ]
 }
+
+
+@dataclass(frozen=True)
+class LiquidClassSpec:
+    """Calibrated rheology profile scaling pipette flow rates, air gaps, and settle delays."""
+
+    name: str
+    aspirate_scale: float
+    dispense_scale: float
+    air_gap_fraction: float = 0.0
+    min_air_gap_ul: float = 0.0
+    max_air_gap_ul: float = 0.0
+    touch_tip: bool = False
+    aspirate_delay_s: float = 0.0
+
+
+LIQUID_CLASS_CATALOG: dict[str, LiquidClassSpec] = {
+    "aqueous": LiquidClassSpec(
+        name="aqueous",
+        aspirate_scale=1.0,
+        dispense_scale=1.0,
+        air_gap_fraction=0.0,
+        min_air_gap_ul=0.0,
+        max_air_gap_ul=0.0,
+        touch_tip=False,
+        aspirate_delay_s=0.0,
+    ),
+    "viscous_glycerol": LiquidClassSpec(
+        name="viscous_glycerol",
+        aspirate_scale=0.25,
+        dispense_scale=0.30,
+        air_gap_fraction=0.0,
+        min_air_gap_ul=0.0,
+        max_air_gap_ul=0.0,
+        touch_tip=True,
+        aspirate_delay_s=2.0,
+    ),
+    "volatile_ethanol": LiquidClassSpec(
+        name="volatile_ethanol",
+        aspirate_scale=0.60,
+        dispense_scale=0.85,
+        air_gap_fraction=0.10,
+        min_air_gap_ul=2.0,
+        max_air_gap_ul=20.0,
+        touch_tip=False,
+        aspirate_delay_s=0.2,
+    ),
+    "serum": LiquidClassSpec(
+        name="serum",
+        aspirate_scale=0.50,
+        dispense_scale=0.50,
+        air_gap_fraction=0.0,
+        min_air_gap_ul=0.0,
+        max_air_gap_ul=0.0,
+        touch_tip=True,
+        aspirate_delay_s=0.5,
+    ),
+}
+
+_LIQUID_CLASS_ALIASES: dict[str, str] = {
+    "glycerol_80pct": "viscous_glycerol",
+    "ethanol_volatile": "volatile_ethanol",
+    "dmso": "serum",
+    "fragile_cells": "serum",
+}
+
+
+def normalize_liquid_class_name(name: str) -> str | None:
+    """Resolve canonical liquid-class profile name (`aqueous | viscous_glycerol | volatile_ethanol | serum`)."""
+    token = name.strip()
+    if token in LIQUID_CLASS_CATALOG:
+        return token
+    return _LIQUID_CLASS_ALIASES.get(token)
+
+
+def build_rheology_spec(
+    pip: PipetteConfig,
+    volume_ul: float,
+    *,
+    liquid_class: str = "aqueous",
+    aspirate_flow_rate: float | None = None,
+    dispense_flow_rate: float | None = None,
+    air_gap_ul: float | None = None,
+    touch_tip: bool | None = None,
+    aspirate_delay_s: float | None = None,
+    allow_air_gap: bool = True,
+) -> RheologySpec:
+    """Compute calibrated `RheologySpec` for `pip` and `volume_ul` under `liquid_class`."""
+    canonical = normalize_liquid_class_name(liquid_class)
+    if canonical is None:
+        raise ValueError(f"Unknown liquid_class {liquid_class!r}")
+    profile = LIQUID_CLASS_CATALOG[canonical]
+
+    asp_rate = (
+        round(max(0.5, pip.spec.nominal_aspirate_rate * profile.aspirate_scale), 2)
+        if aspirate_flow_rate is None
+        else round(aspirate_flow_rate, 4)
+    )
+    disp_rate = (
+        round(max(0.5, pip.spec.nominal_dispense_rate * profile.dispense_scale), 2)
+        if dispense_flow_rate is None
+        else round(dispense_flow_rate, 4)
+    )
+
+    if not allow_air_gap:
+        resolved_air_gap = 0.0
+    elif air_gap_ul is not None:
+        resolved_air_gap = round(air_gap_ul, 4)
+    elif profile.air_gap_fraction > 0.0:
+        raw_ag = min(
+            profile.max_air_gap_ul,
+            max(profile.min_air_gap_ul, volume_ul * profile.air_gap_fraction),
+        )
+        max_headroom = max(0.0, pip.effective_max_volume - pip.spec.min_volume)
+        resolved_air_gap = round(min(raw_ag, max_headroom * 0.5), 2)
+    else:
+        resolved_air_gap = 0.0
+
+    resolved_touch = profile.touch_tip if touch_tip is None else bool(touch_tip)
+    resolved_delay = (
+        profile.aspirate_delay_s if aspirate_delay_s is None else round(aspirate_delay_s, 4)
+    )
+    return RheologySpec(
+        liquid_class=canonical,
+        aspirate_flow_rate=asp_rate,
+        dispense_flow_rate=disp_rate,
+        air_gap_ul=resolved_air_gap,
+        touch_tip=resolved_touch,
+        aspirate_delay_s=resolved_delay,
+    )
 
 
 DEFAULT_API_LEVEL = "2.16"
@@ -219,12 +352,13 @@ def get_labware_spec(load_name: str) -> LabwareSpec | None:
     except ImportError:
         return None
     defn: dict[str, Any] | None = None
+    load_fn: Any = load_definition
     try:
-        defn = load_definition(load_name)
+        defn = dict(load_fn(load_name))
     except TypeError:
         for version in (3, 2, 1):
             try:
-                defn = load_definition(load_name, version)
+                defn = dict(load_fn(load_name, version))
                 break
             except (FileNotFoundError, KeyError, ValueError, PythonException):
                 continue
@@ -241,7 +375,10 @@ def get_labware_spec(load_name: str) -> LabwareSpec | None:
     well_volumes = {
         w: float(defn["wells"][w]["totalLiquidVolume"]) for w in wells
     }
-    is_tiprack = bool(defn["parameters"]["isTiprack"])
+    params = defn["parameters"]
+    is_tiprack = bool(params["isTiprack"])
+    quirks = params.get("quirks", [])
+    touch_tip_disabled = isinstance(quirks, list) and "touchTipDisabled" in quirks
     if not well_volumes:
         max_volume = 0.0
     elif is_tiprack:
@@ -255,6 +392,7 @@ def get_labware_spec(load_name: str) -> LabwareSpec | None:
         max_volume=max_volume,
         is_tiprack=is_tiprack,
         well_volumes=well_volumes,
+        touch_tip_disabled=touch_tip_disabled,
     )
 
 

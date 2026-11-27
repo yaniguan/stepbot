@@ -21,8 +21,8 @@
 
 ### Scope Boundaries
 
-- **Supported**: Opentrons OT-2 `11`-slot deck (`1..11` plus fixed trash on slot `12`) and Opentrons Flex alphanumeric coordinate deck (`A1..D3` plus staging `A4..D4` and configurable `load_trash_bin('A3')` in `apiLevel` `2.18`--`2.20`); `30` built-in labware specs (with dynamic fallback to `opentrons_shared_data` when installed); OT-2 single-channel Gen1/Gen2 pipettes and Flex 1-/8-channel pipettes (`flex_1channel_50/1000`, `flex_8channel_50/1000`); `transfer`, `distribute`, `mix`, `discard`, `dilution_series` macro expansion, `delay`, `pause`, `comment`, crash-safe `lean-mcp/v1` state persistence, and hardware-optional `:31950` HTTP Run API v2 execution (`OpentronsHttpRunAdapter`, verified locally via loopback `ThreadingHTTPServer`).
-- **Out of scope / explicitly rejected**: Hardware modules (thermocycler, heater-shaker, temperature, magnetic), custom labware JSON files, and legacy OT-2 multichannel pipettes (`p*_multi*`).
+- **Supported**: Opentrons OT-2 `11`-slot deck (`1..11` plus fixed trash on slot `12`) and Opentrons Flex alphanumeric coordinate deck (`A1..D3` plus staging `A4..D4` and configurable `load_trash_bin('A3')` in `apiLevel` `2.18`--`2.20`); `30` built-in labware specs (with dynamic fallback to `opentrons_shared_data` when installed); OT-2 single- and 8-channel Gen1/Gen2 pipettes (`p10/20/50/300/1000_single*`, `p10/20/50/300_multi*`) and Flex 1-/8-channel pipettes (`flex_1channel_50/1000`, `flex_8channel_50/1000`); `transfer` (with canonical Opentrons 8.8.2 two-stage `multi_aspirate` stroke splitting and `dispense_position: bottom|top`), `distribute` (including `disposal_volume: 0` without blow-out), `mix`, `discard`, `dilution_series` macro expansion, liquid-class rheology (`aqueous | viscous_glycerol | volatile_ethanol | serum`), strict non-finite (`NaN`/`Inf`) rejection, `delay`, `pause`, `comment`, crash-safe `lean-mcp/v1` state persistence, and hardware-optional `:31950` HTTP Run API v2 execution (`OpentronsHttpRunAdapter`, verified locally via loopback `ThreadingHTTPServer`).
+- **Out of scope / explicitly rejected**: Hardware modules (thermocycler, heater-shaker, temperature, magnetic), custom labware JSON files, and partial-column (< 8 tip) multichannel pickup.
 
 ---
 
@@ -57,9 +57,9 @@
   - Tube racks (`5`): Opentrons `24`-tube Eppendorf/NEST `1.5 mL`, `15`-tube Falcon `15 mL`, `6`-tube Falcon `50 mL`, and mixed non-rectangular `opentrons_10_tuberack_falcon_4x50ml_6x15ml_conical` (`A1..C2` 6×15 mL + `A3..B4` 4×50 mL).
   - Tip racks (`7`): Opentrons `96` standard (`10`, `20`, `300`, `1000 uL`) and filter (`20`, `200`, `1000 uL`).
   - Dynamic fallback: When `opentrons_shared_data` is installed, `get_labware_spec()` loads version-1 definitions on demand.
-- **`PIPETTE_CATALOG` (`12` models)**:
-  - Single-channel (`7`): `p10_single` (`1–10 uL`), `p20_single_gen2` (`1–20 uL`), `p50_single` (`5–50 uL`), `p300_single` (`30–300 uL`), `p300_single_gen2` (`20–300 uL`), `p1000_single` (`100–1000 uL`), `p1000_single_gen2` (`100–1000 uL`).
-  - Eight-channel (`5`): `p10_multi`, `p20_multi_gen2`, `p50_multi`, `p300_multi`, `p300_multi_gen2` (`channels=8`; rejected on `origin/review-fixes` until multi-channel column semantics are modeled).
+- **`PIPETTE_CATALOG` (`16` models)**:
+  - Single-channel (`9`): `p10_single` (`1–10 uL`), `p20_single_gen2` (`1–20 uL`), `p50_single` (`5–50 uL`), `p300_single` (`30–300 uL`), `p300_single_gen2` (`20–300 uL`), `p1000_single` (`100–1000 uL`), `p1000_single_gen2` (`100–1000 uL`), `flex_1channel_50` (`5–50 uL`), `flex_1channel_1000` (`5–1000 uL`).
+  - Eight-channel (`7`): `p10_multi`, `p20_multi_gen2`, `p50_multi`, `p300_multi`, `p300_multi_gen2`, `flex_8channel_50`, `flex_8channel_1000` (`channels=8`; validated against 8-row `A..H` labware via row-`A` column heads, broadcasting volume/lineage across `A..H` and consuming `8` physical tips per pickup).
 
 ### 2.3 Bundled Reference Protocols (`examples/` & `examples/out/`)
 
@@ -114,8 +114,9 @@
 
 - **Byte-for-byte determinism**: `tests/test_examples.py` verifies `compile_file(yaml_path) == committed_py` across all three bundled protocols.
 - **Test & CI progression**:
-  - On `main` (`4534ff1`): `40` pytest cases across `4` test modules (`37` mock + CLI + validation tests running in `0.21 s` without `opentrons`, plus `3` real `opentrons.simulate` integration tests; `40 passed in 1.71s` in Linux `[sim,dev]` CI across Python `3.11` and `3.12`).
-  - On `origin/review-fixes` (`ef6865f`): Expanded to `73` pytest cases (`70 passed, 3 skipped` without `opentrons`), adding `33` targeted tests for cumulative multi-step well overfill, dry-well aspiration, `mix`/`mix_after` exceeding well volume, overlapping `liquids` declarations, `apiLevel < 2.14` liquid gating, unquoted YAML `2.10` float rejection, environment-independent default `apiLevel`, multichannel pipette rejection, and reserved deck-alias collision prevention.
+  - `278` pytest cases (`278 passed` with `opentrons 8.8.2`, `272 passed, 6 skipped` without `[sim]`), plus `mypy --strict src/stepbot` and zero-`sorry` Lean 4.36.0 proofs (`lean/StepbotLean.lean`).
+  - **Differential verification (`tests/test_sim_differential.py`)**: `311 / 311` (`100.0%`) accepted seeded protocols and `3 / 3` bundled examples match `opentrons.simulate` `8.8.2` primitive actions `(action, volume, well, slot)` and physical tip consumption (`ALLOWED_DIFFERENCES = {}`).
+  - **Public wet-lab benchmark (`benchmarks/public_protocols_eval.py`)**: `36 / 36` (`100.0%`) exact agreement across `3,607` primitive actions and `971` physical tips spanning ELISA, PCR/qPCR setup, serial dilutions, SPRI bead cleanup, Bradford/BCA protein quantification, and NGS library prep.
 
 ---
 
@@ -138,10 +139,9 @@
 
 ### Known Limitations
 
-- **Nominal vs. disposal volume in `distribute`**: Opentrons `InstrumentContext.distribute` aspirates an extra `disposal_volume` (defaulting to `1×` pipette `min_volume`, e.g., `20 uL` on `p300_single_gen2`, hence `220 uL` instead of `200 uL` in real simulator logs and `100` vs. `86` commands on `dilution_series.py`) and blows it out to trash on every chunk; neither `_WellVolumeTracker` nor `MockProtocolContext` deducts `disposal_volume` from the source well.
-- **Uniform `max_volume` per labware**: `_falcon_4x50_6x15_spec()` assigns `max_volume = 15000.0 uL` across all 10 wells, under-reporting the capacity of the four `50 mL` wells (`A3`, `B3`, `A4`, `B4`), and `get_labware_spec()` copies `first_well["totalLiquidVolume"]` to all wells.
-- **No multi-aspirate volume splitting**: `transfer` volumes exceeding `pip.spec.max_volume` fail validation instead of splitting into multiple aspirate/dispense strokes as Opentrons' native `transfer()` supports.
-- **Untrusted code execution in mock checker**: `_check_with_mock()` calls Python `exec()` on the target `.py` file; it is designed for locally compiled protocols, not untrusted third-party scripts.
+- **Hardware modules & custom labware**: Thermocycler, heater-shaker, temperature, and magnetic block modules as well as custom labware JSON files are not modeled.
+- **Full-column multichannel addressing**: 8-channel pipettes always pick up and dispense across all 8 nozzles (`A..H`); partial-column tip pickup is not modeled.
+- **Simulator version window**: Official simulation via `.[sim]` targets `opentrons>=7.0,<9.0` (`8.8.2` verified in CI).
 
 ### Ecosystem Interfaces Across Auto-Lab
 

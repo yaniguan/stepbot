@@ -280,11 +280,23 @@ def test_reserved_deck_alias_rejected(alias: str) -> None:
         compile_protocol(data)
 
 
-def test_multichannel_pipette_rejected() -> None:
+def test_multichannel_pipette_column_targeting_and_incompatible_labware() -> None:
     data = _base_protocol()
     data["pipettes"]["left"]["model"] = "p300_multi_gen2"
-    with pytest.raises(ValidationError, match="Multichannel pipette 'p300_multi_gen2'"):
-        compile_protocol(data)
+    # Row A column head on 96-well plate + 12-well reservoir compiles cleanly across A1..H1
+    assert "p300_multi_gen2" in compile_protocol(data)
+
+    # Non-row-A target is rejected for 8-channel pipette
+    bad_row = copy.deepcopy(data)
+    bad_row["steps"] = [{"transfer": {"src": "reservoir:A1", "dst": "plate:B1", "volume": 100}}]
+    with pytest.raises(ValidationError, match="8-channel pipette must target row 'A' column heads"):
+        compile_protocol(bad_row)
+
+    # 4-row 24-well plate cannot be addressed by 8-channel pipette
+    bad_lw = copy.deepcopy(data)
+    bad_lw["deck"]["plate"]["labware"] = "corning_24_wellplate_3.4ml_flat"
+    with pytest.raises(ValidationError, match="8-channel pipette cannot address 4-row labware"):
+        compile_protocol(bad_lw)
 
 
 @pytest.mark.parametrize("bad_level", [2.1, 2, True])
