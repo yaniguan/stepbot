@@ -151,7 +151,99 @@ theorem stepbot_slots_and_tips_valid (c : StepbotCompileCheck)
   rcases hok with ⟨h1, _, _, h4⟩
   exact ⟨h1, h4⟩
 
-/-! ## Inductive Multi-Step Tip-Rack Depletion & Source Conservation (`#31`) -/
+/-! ## Opentrons 8.8.2 Two-Stage Multi-Aspirate Stroke Splitting & Tip Depletion (`#31`, `#35`) -/
+
+/-- Fuel-bounded outer volume split mirroring Opentrons `expand_for_volume_constraints`. -/
+def expandVolumeOuterAux : Nat → Nat → Nat → List Nat
+  | 0, rem, _ => [rem]
+  | fuel + 1, rem, pipMax =>
+    if rem > pipMax * 2 then
+      pipMax :: expandVolumeOuterAux fuel (rem - pipMax) pipMax
+    else if rem > pipMax then
+      let half1 := rem / 2
+      [half1, rem - half1]
+    else
+      [rem]
+
+/-- Outer volume split by `pipette.max_volume` (`0.1 uL` units). -/
+def expandVolumeOuter (vol pipMax : Nat) : List Nat :=
+  if vol = 0 ∨ pipMax = 0 then []
+  else expandVolumeOuterAux vol vol pipMax
+
+/-- Fuel-bounded inner volume split by tip-capped effective max ("max first, then remainder"). -/
+def splitByTipMaxAux : Nat → Nat → Nat → List Nat
+  | 0, rem, _ => if rem = 0 then [] else [rem]
+  | fuel + 1, rem, effMax =>
+    if rem = 0 then []
+    else if rem > effMax then
+      effMax :: splitByTipMaxAux fuel (rem - effMax) effMax
+    else
+      [rem]
+
+/-- Inner volume split by `min(pipette.max_volume, tiprack.max_volume)` (`0.1 uL` units). -/
+def splitByTipMax (stepVol effMax : Nat) : List Nat :=
+  if stepVol = 0 ∨ effMax = 0 then []
+  else splitByTipMaxAux stepVol stepVol effMax
+
+/-- Canonical two-stage Opentrons 8.8.2 stroke groups `[[s_11, ...], [s_21, ...], ...]`. -/
+def planTransferStrokeGroups (vol pipMax effMax : Nat) : List (List Nat) :=
+  (expandVolumeOuter vol pipMax).map (fun stepVol => splitByTipMax stepVol effMax)
+
+/-- Flattened stroke list across all outer tip groups for one `(src, dst)` well pair. -/
+def flatTransferStrokes (vol pipMax effMax : Nat) : List Nat :=
+  (planTransferStrokeGroups vol pipMax effMax).flatten
+
+/-- Every planned inner stroke must satisfy `pipMin <= s <= effMax`. -/
+def strokesWithinBounds (strokes : List Nat) (pipMin effMax : Nat) : Bool :=
+  !strokes.isEmpty && strokes.all (fun s => decide (pipMin ≤ s ∧ s ≤ effMax))
+
+theorem expandVolumeOuterAux_sum (fuel rem pipMax : Nat) :
+    (expandVolumeOuterAux fuel rem pipMax).sum = rem := by
+  induction fuel generalizing rem with
+  | zero =>
+    simp [expandVolumeOuterAux]
+  | succ f ih =>
+    unfold expandVolumeOuterAux
+    split
+    · rename_i hgt2
+      have hih := ih (rem - pipMax)
+      simp [List.sum_cons, hih]
+      omega
+    · split
+      · simp [List.sum_cons]
+        omega
+      · simp
+
+theorem expandVolumeOuter_sum (vol pipMax : Nat) (hv : 0 < vol) (hp : 0 < pipMax) :
+    (expandVolumeOuter vol pipMax).sum = vol := by
+  unfold expandVolumeOuter
+  have hne : ¬(vol = 0 ∨ pipMax = 0) := by omega
+  simp [hne, expandVolumeOuterAux_sum]
+
+theorem splitByTipMaxAux_sum (fuel rem effMax : Nat) :
+    (splitByTipMaxAux fuel rem effMax).sum = rem := by
+  induction fuel generalizing rem with
+  | zero =>
+    unfold splitByTipMaxAux
+    split <;> simp_all
+  | succ f ih =>
+    unfold splitByTipMaxAux
+    split
+    · simp_all
+    · split
+      · rename_i _ hgt
+        have hih := ih (rem - effMax)
+        simp [List.sum_cons, hih]
+        omega
+      · simp
+
+theorem splitByTipMax_sum (stepVol effMax : Nat) (heff : 0 < effMax) :
+    (splitByTipMax stepVol effMax).sum = stepVol := by
+  unfold splitByTipMax
+  by_cases hs : stepVol = 0
+  · subst hs; simp
+  · have hne : ¬(stepVol = 0 ∨ effMax = 0) := by omega
+    simp [hne, splitByTipMaxAux_sum]
 
 /-- Opentrons `new_tip` lifecycle policy for lowered liquid-handling operations. -/
 inductive NewTipMode where
@@ -167,17 +259,18 @@ inductive ProtocolOp where
   | mix        (nWells : Nat) (vol : Nat) (reps : Nat) (mode : NewTipMode)
   deriving DecidableEq, Repr
 
-/-- Exact clean-tip consumption and post-step `hasTip` state mirroring `_TipStateTracker`. -/
-def stepTipCount (hasTip : Bool) : ProtocolOp → Nat × Bool
-  | .transfer _ _ .never       => (if hasTip then 0 else 1, true)
-  | .transfer _ _ .once        => (1, false)
-  | .transfer fanout _ .always => (fanout, false)
-  | .distribute _ _ _ .never   => (if hasTip then 0 else 1, true)
-  | .distribute _ _ _ .once    => (1, false)
-  | .distribute _ _ _ .always  => (1, false)
-  | .mix _ _ _ .never          => (if hasTip then 0 else 1, true)
-  | .mix _ _ _ .once           => (1, false)
-  | .mix nWells _ _ .always    => (nWells, false)
+/-- Exact clean-tip consumption and post-step `hasTip` state mirroring `_TipStateTracker` (#35:
+    `new_tip = .always` consumes one clean tip per outer `expand_for_volume_constraints` group). -/
+def stepTipCount (pipMax : Nat) (hasTip : Bool) : ProtocolOp → Nat × Bool
+  | .transfer _ _ .never        => (if hasTip then 0 else 1, true)
+  | .transfer _ _ .once         => (1, false)
+  | .transfer fanout vol .always => (fanout * (expandVolumeOuter vol pipMax).length, false)
+  | .distribute _ _ _ .never    => (if hasTip then 0 else 1, true)
+  | .distribute _ _ _ .once     => (1, false)
+  | .distribute _ _ _ .always   => (1, false)
+  | .mix _ _ _ .never           => (if hasTip then 0 else 1, true)
+  | .mix _ _ _ .once            => (1, false)
+  | .mix nWells _ _ .always     => (nWells, false)
 
 /-- Sequential tip-rack inventory depletion mirroring `_TipStateTracker.consume_tips`. -/
 def consumeRacks : List Nat → Nat → Option (List Nat)
@@ -240,6 +333,8 @@ def opsRequiredSource (effMax : Nat) : List ProtocolOp → Nat
 
 /-- Mutable deck execution state threaded across multi-step `ProtocolOp` verification. -/
 structure ProtocolExecState where
+  pipMinTenthUL : Nat := 200
+  pipMaxTenthUL : Nat := 3000
   effMaxTenthUL : Nat
   racks         : List Nat
   tipsConsumed  : Nat
@@ -249,15 +344,16 @@ structure ProtocolExecState where
   destCap       : Nat
   deriving DecidableEq, Repr
 
-/-- Execute and verify a single `ProtocolOp` against tip-rack, pipette, and well bounds. -/
+/-- Execute and verify a single `ProtocolOp` against tip-rack, pipette, stroke, and well bounds. -/
 def stepProtocol (st : ProtocolExecState) (op : ProtocolOp) :
     Except RegimeViolation ProtocolExecState :=
-  let (neededTips, nextHasTip) := stepTipCount st.hasTip op
+  let (neededTips, nextHasTip) := stepTipCount st.pipMaxTenthUL st.hasTip op
   match op with
   | .transfer fanout vol _ =>
-    if !(0 < fanout ∧ 0 < vol ∧ vol ≤ st.effMaxTenthUL) then
-      .error { repo := "stepbot", rule := "transfer_bounds",
-               detail := "transfer requires positive fanout and 0 < vol <= effMax" }
+    let strokes := flatTransferStrokes vol st.pipMaxTenthUL st.effMaxTenthUL
+    if !(0 < fanout ∧ 0 < vol ∧ strokesWithinBounds strokes st.pipMinTenthUL st.effMaxTenthUL) then
+      .error { repo := "stepbot", rule := "transfer_stroke_bounds",
+               detail := "transfer requires positive fanout and every Opentrons stroke within [pipMin, effMax]" }
     else if !(fanout * vol ≤ st.sourceVol) then
       .error { repo := "stepbot", rule := "source_underflow",
                detail := "transfer aspirates more liquid than source well contains" }
@@ -347,7 +443,7 @@ theorem stepProtocol_invariants (st st' : ProtocolExecState) (op : ProtocolOp)
         split at hok
         · cases hok
         · rename_i hdst
-          cases hcr : consumeRacks st.racks (stepTipCount st.hasTip (.transfer fanout vol mode)).1 with
+          cases hcr : consumeRacks st.racks (stepTipCount st.pipMaxTenthUL st.hasTip (.transfer fanout vol mode)).1 with
           | none => simp [hcr] at hok
           | some racks' =>
             simp [hcr] at hok
@@ -368,7 +464,7 @@ theorem stepProtocol_invariants (st st' : ProtocolExecState) (op : ProtocolOp)
           split at hok
           · cases hok
           · rename_i hdst
-            cases hcr : consumeRacks st.racks (stepTipCount st.hasTip (.distribute nDst vol dispVol mode)).1 with
+            cases hcr : consumeRacks st.racks (stepTipCount st.pipMaxTenthUL st.hasTip (.distribute nDst vol dispVol mode)).1 with
             | none => simp [hcr] at hok
             | some racks' =>
               simp [hcr] at hok
@@ -384,7 +480,7 @@ theorem stepProtocol_invariants (st st' : ProtocolExecState) (op : ProtocolOp)
     · split at hok
       · cases hok
       · rename_i _ hcap
-        cases hcr : consumeRacks st.racks (stepTipCount st.hasTip (.mix nWells vol reps mode)).1 with
+        cases hcr : consumeRacks st.racks (stepTipCount st.pipMaxTenthUL st.hasTip (.mix nWells vol reps mode)).1 with
         | none => simp [hcr] at hok
         | some racks' =>
           simp [hcr] at hok
@@ -660,6 +756,26 @@ def sampleInitExecState : ProtocolExecState :=
 
 -- Ethanol whose `transferVol + airGap` overflows `min(3000, 2000) = 2000` is rejected
 #guard (checkRheologyLowering { validEthanolLowering with airGapTenthUL := 1300 }).isSome == true
+
+-- Issue #35 multi-aspirate stroke splitting & per-stroke tip depletion witnesses:
+-- (1) 700 uL (7000) on p300 (3000) + 300 uL tips (3000) -> [[3000], [2000], [2000]] -> 40 * 3 = 120 tips (> 96)
+#guard planTransferStrokeGroups 7000 3000 3000 == [[3000], [2000], [2000]]
+#guard (stepTipCount 3000 false (.transfer 40 7000 .always)).1 == 120
+#guard (stepProtocol { sampleInitExecState with racks := [96], sourceVol := 500000, destCap := 500000 }
+        (.transfer 40 7000 .always)).isOk == false
+#guard (stepProtocol { sampleInitExecState with racks := [96, 96], sourceVol := 500000, destCap := 500000 }
+        (.transfer 40 7000 .always)).toOption.map (·.tipsConsumed) == some 120
+
+-- (2) 600 uL (6000) into 2 wells with `always` -> [[3000], [3000]] -> 2 * 2 = 4 tips
+#guard (stepTipCount 3000 false (.transfer 2 6000 .always)).1 == 4
+
+-- (3) p300 (min 200 = 20 uL, max 3000) + 200 uL filter tips (2000), 210 uL (2100) -> [[2000, 100]] rejected (< 200)
+#guard planTransferStrokeGroups 2100 3000 2000 == [[2000, 100]]
+#guard (stepProtocol { sampleInitExecState with effMaxTenthUL := 2000 } (.transfer 1 2100 .once)).isOk == false
+
+-- (4) Same pipette/tips, 405 uL (4050) -> [[2000, 25], [2000, 25]] rejected (< 200)
+#guard planTransferStrokeGroups 4050 3000 2000 == [[2000, 25], [2000, 25]]
+#guard (stepProtocol { sampleInitExecState with effMaxTenthUL := 2000 } (.transfer 1 4050 .always)).isOk == false
 
 -- 80% glycerol without post-aspirate equilibration pause is rejected
 #guard (checkRheologyLowering { validGlycerolLowering with postAspirateWaitMs := 200 }).isSome == true

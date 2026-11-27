@@ -48,6 +48,7 @@ steps:
       dst: plate:A5-A8
       volume: 50
       new_tip: once
+      dispense_position: top
   - mix:
       wells: plate:A1-A8
       volume: 100

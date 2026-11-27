@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 import math
+from pathlib import Path
 import re
 import tempfile
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from stepbot.catalog import (
@@ -24,12 +25,28 @@ from stepbot.catalog import (
     is_valid_flex_slot,
     parse_api_level,
 )
-from stepbot.models import VOLUME_TOLERANCE, DeckSlot, LabwareSpec, PipetteSpec
+from stepbot.models import (
+    VOLUME_TOLERANCE,
+    DeckSlot,
+    LabwareSpec,
+    PipetteSpec,
+    plan_distribute_chunks,
+    plan_transfer_strokes,
+)
 
 _API_LEVEL_RE = re.compile(r"^\d+\.\d+$")
 _MIN_LIQUID_API_LEVEL = (2, 14)
 _MIN_FLEX_API_LEVEL = (2, 15)
 _MAX_LOOP_ITERATIONS = 10_000
+
+
+def _require_finite_num(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a finite number, got {value!r}")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{label} must be a finite number, got {value!r}")
+    return out
 
 
 def _fmt_log_vol(volume: float) -> str:
@@ -101,6 +118,7 @@ class _MockWell:
     max_volume: float
     api_level: tuple[int, int] = (2, 16)
     has_tip: bool = False
+    touch_tip_disabled: bool = False
     volume: float = field(default=0.0)
     _touched: bool = field(default=False)
 
@@ -113,45 +131,44 @@ class _MockWell:
                 f"Well.load_liquid requires apiLevel 2.14 or newer, "
                 f"got '{self.api_level[0]}.{self.api_level[1]}'"
             )
-        if isinstance(volume, bool) or not isinstance(volume, (int, float)):
-            raise ValueError(f"Liquid volume must be a number, got {volume!r}")
-        if volume < 0 or volume > self.max_volume + VOLUME_TOLERANCE:
+        vol = _require_finite_num(volume, "Liquid volume")
+        if vol < 0 or vol > self.max_volume + VOLUME_TOLERANCE:
             raise ValueError(
-                f"Cannot load {volume} uL of '{liquid.name}' into {self}: "
+                f"Cannot load {vol} uL of '{liquid.name}' into {self}: "
                 f"well capacity is {self.max_volume} uL"
             )
-        self.volume = float(volume)
+        self.volume = vol
         self._touched = True
 
     def top(self, z: float | None = None) -> _MockLocation:
-        if z is not None and (isinstance(z, bool) or not isinstance(z, (int, float))):
-            raise ValueError(f"Well.top(z) offset must be numeric, got {z!r}")
-        return _MockLocation(self, "top", float(z) if z is not None else None)
+        z_val = _require_finite_num(z, "Well.top(z) offset") if z is not None else None
+        return _MockLocation(self, "top", z_val)
 
     def bottom(self, z: float | None = None) -> _MockLocation:
-        if z is not None and (isinstance(z, bool) or not isinstance(z, (int, float))):
-            raise ValueError(f"Well.bottom(z) offset must be numeric, got {z!r}")
-        return _MockLocation(self, "bottom", float(z) if z is not None else None)
+        z_val = _require_finite_num(z, "Well.bottom(z) offset") if z is not None else None
+        return _MockLocation(self, "bottom", z_val)
 
     def _remove_volume(self, volume: float) -> None:
-        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume < 0:
+        vol = _require_finite_num(volume, "Aspirate volume")
+        if vol < 0:
             raise ValueError(f"Aspirate volume must be a non-negative number, got {volume!r}")
-        if volume > self.volume + VOLUME_TOLERANCE:
+        if vol > self.volume + VOLUME_TOLERANCE:
             raise ValueError(
-                f"Cannot aspirate {volume} uL from {self}: well holds only {self.volume:.2f} uL"
+                f"Cannot aspirate {vol} uL from {self}: well holds only {self.volume:.2f} uL"
             )
-        self.volume = max(0.0, self.volume - float(volume))
+        self.volume = max(0.0, self.volume - vol)
         self._touched = True
 
     def _add_volume(self, volume: float) -> None:
-        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume < 0:
+        vol = _require_finite_num(volume, "Dispense volume")
+        if vol < 0:
             raise ValueError(f"Dispense volume must be a non-negative number, got {volume!r}")
-        if self.volume + volume > self.max_volume + VOLUME_TOLERANCE:
+        if self.volume + vol > self.max_volume + VOLUME_TOLERANCE:
             raise ValueError(
-                f"Cannot dispense {volume} uL into {self}: would hold "
-                f"{self.volume + volume:.2f} uL, above well capacity {self.max_volume} uL"
+                f"Cannot dispense {vol} uL into {self}: would hold "
+                f"{self.volume + vol:.2f} uL, above well capacity {self.max_volume} uL"
             )
-        self.volume += float(volume)
+        self.volume += vol
         self._touched = True
 
 
@@ -175,6 +192,7 @@ class _MockLabware:
                 spec.max_volume_for(w),
                 api_level=api_level,
                 has_tip=spec.is_tiprack,
+                touch_tip_disabled=spec.touch_tip_disabled,
             )
             for w in spec.wells
         }
@@ -216,8 +234,14 @@ class _MockInstrumentContext:
         self.tip_racks = tip_racks
         self._log = log
         self._ctx = ctx
-        self.flow_rate = _MockFlowRate()
+        self.flow_rate = _MockFlowRate(
+            spec.nominal_aspirate_rate,
+            spec.nominal_dispense_rate,
+            spec.nominal_blow_out_rate,
+        )
         self.has_tip = False
+        self._mounted_tip_max_volume: float | None = None
+        self._last_well: _MockWell | None = None
         self.current_volume = 0.0
         self._air_gap_volume = 0.0
         self.tips_used = 0
@@ -230,6 +254,41 @@ class _MockInstrumentContext:
         else:
             self.effective_max_volume = spec.max_volume
 
+    def _current_working_volume(self) -> float:
+        if self._mounted_tip_max_volume is not None:
+            return min(self.spec.max_volume, self._mounted_tip_max_volume)
+        return self.effective_max_volume
+
+    def _peek_next_tip_max_volume(self) -> float | None:
+        channels = self.spec.channels
+        if channels == 1:
+            for rack in self.tip_racks:
+                for well in rack.wells():
+                    if well.has_tip:
+                        return well.max_volume
+            return None
+        for rack in self.tip_racks:
+            max_col = max(c for _, c in rack.spec.well_grid.values())
+            for col in range(max_col + 1):
+                entries = sorted(
+                    (r, w_name)
+                    for w_name, (r, c) in rack.spec.well_grid.items()
+                    if c == col
+                )
+                if len(entries) == channels:
+                    cand = [rack[w_name] for _, w_name in entries]
+                    if all(w.has_tip for w in cand):
+                        return cand[0].max_volume
+        return None
+
+    def _active_working_volume(self, new_tip: str) -> float:
+        if new_tip == "never":
+            return self._current_working_volume()
+        peek = self._peek_next_tip_max_volume()
+        if peek is not None:
+            return min(self.spec.max_volume, peek)
+        return self.effective_max_volume
+
     def _require_tip(self, action: str) -> None:
         if not self.has_tip:
             raise RuntimeError(f"Pipette '{self.model}' ({self.mount}) has no tip for {action}")
@@ -237,16 +296,16 @@ class _MockInstrumentContext:
     def _default_trash(self) -> _MockTrash:
         return self._ctx._require_default_trash()
 
-    def _check_vol(self, volume: float, action: str) -> None:
-        if isinstance(volume, bool) or not isinstance(volume, (int, float)):
-            raise ValueError(f"{action} volume must be a number, got {volume!r}")
+    def _check_vol(self, volume: float, action: str, *, max_cap: float | None = None) -> None:
+        vol = _require_finite_num(volume, f"{action} volume")
+        cap = self._current_working_volume() if max_cap is None else max_cap
         if (
-            volume < self.spec.min_volume - VOLUME_TOLERANCE
-            or volume > self.effective_max_volume + VOLUME_TOLERANCE
+            vol < self.spec.min_volume - VOLUME_TOLERANCE
+            or vol > cap + VOLUME_TOLERANCE
         ):
             raise ValueError(
-                f"{action} volume {volume} uL outside "
-                f"[{self.spec.min_volume}, {self.effective_max_volume}] uL"
+                f"{action} volume {vol} uL outside "
+                f"[{self.spec.min_volume}, {cap}] uL"
             )
 
     def _resolve_well_channels(
@@ -280,16 +339,24 @@ class _MockInstrumentContext:
             f"labware '{lw.load_name}'"
         )
 
-    def pick_up_tip(self, location: _MockWell | None = None) -> None:
+    def pick_up_tip(self, location: _MockWell | _MockLocation | None = None) -> None:
         if self.has_tip:
             raise RuntimeError(f"Pipette '{self.model}' ({self.mount}) already has a tip")
+        loc_well: _MockWell | None = None
+        if location is not None:
+            if isinstance(location, _MockLocation):
+                loc_well = location.well
+            elif isinstance(location, _MockWell):
+                loc_well = location
+            else:
+                raise RuntimeError(f"No tip available at {location}")
         channels = self.spec.channels
         if channels == 1:
             target: _MockWell | None = None
-            if location is not None:
-                if not isinstance(location, _MockWell) or not location.has_tip:
-                    raise RuntimeError(f"No tip available at {location}")
-                target = location
+            if loc_well is not None:
+                if not loc_well.has_tip:
+                    raise RuntimeError(f"No tip available at {loc_well}")
+                target = loc_well
             else:
                 for rack in self.tip_racks:
                     for well in rack.wells():
@@ -305,6 +372,7 @@ class _MockInstrumentContext:
             target.has_tip = False
             self.tips_used += 1
             self.has_tip = True
+            self._mounted_tip_max_volume = target.max_volume
             self.current_volume = 0.0
             self._air_gap_volume = 0.0
             self._log.append(f"Picking up tip from {target}")
@@ -312,12 +380,10 @@ class _MockInstrumentContext:
 
         # 8-channel column pickup across rows A..H
         col_wells: list[_MockWell] | None = None
-        if location is not None:
-            if not isinstance(location, _MockWell):
-                raise RuntimeError(f"No tip available at {location}")
-            resolved, mult = self._resolve_well_channels(location, "pick_up_tip")
+        if loc_well is not None:
+            resolved, mult = self._resolve_well_channels(loc_well, "pick_up_tip")
             if mult != 1 or len(resolved) != channels or not all(w.has_tip for w in resolved):
-                raise RuntimeError(f"No full {channels}-tip column available at {location}")
+                raise RuntimeError(f"No full {channels}-tip column available at {loc_well}")
             col_wells = resolved
         else:
             for rack in self.tip_racks:
@@ -343,6 +409,7 @@ class _MockInstrumentContext:
             w.has_tip = False
         self.tips_used += channels
         self.has_tip = True
+        self._mounted_tip_max_volume = col_wells[0].max_volume
         self.current_volume = 0.0
         self._air_gap_volume = 0.0
         self._log.append(f"Picking up tip from {col_wells[0]}")
@@ -351,6 +418,7 @@ class _MockInstrumentContext:
         self._require_tip("drop_tip")
         trash = self._default_trash()
         self.has_tip = False
+        self._mounted_tip_max_volume = None
         self.current_volume = 0.0
         self._air_gap_volume = 0.0
         self._log.append(f"Dropping tip into {trash}")
@@ -359,9 +427,10 @@ class _MockInstrumentContext:
         self._require_tip("aspirate")
         self._check_vol(volume, "aspirate")
         vol = float(volume)
-        if self.current_volume + vol > self.effective_max_volume + VOLUME_TOLERANCE:
+        cap = self._current_working_volume()
+        if self.current_volume + vol > cap + VOLUME_TOLERANCE:
             raise ValueError(
-                f"Cannot aspirate {volume} uL: exceeds max volume {self.effective_max_volume} uL"
+                f"Cannot aspirate {volume} uL: exceeds max volume {cap} uL"
             )
         well = _unwrap_well_target(location, "aspirate")
         if well.has_tip or (
@@ -374,18 +443,20 @@ class _MockInstrumentContext:
         if not self._in_composite_op:
             self.max_op_volume_ul = max(self.max_op_volume_ul, vol)
         self.current_volume += vol
+        self._last_well = well
         self._log.append(f"Aspirating {_fmt_log_vol(vol)} uL from {location}")
 
     def air_gap(self, volume: float = 0.0, height: float | None = None) -> None:
         self._require_tip("air_gap")
-        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume < 0:
+        vol = _require_finite_num(volume, "air_gap volume")
+        if vol < 0:
             raise ValueError(f"air_gap volume must be a non-negative number, got {volume!r}")
-        if height is not None and (isinstance(height, bool) or not isinstance(height, (int, float))):
-            raise ValueError(f"air_gap height must be numeric, got {height!r}")
-        vol = float(volume)
-        if self.current_volume + vol > self.effective_max_volume + VOLUME_TOLERANCE:
+        if height is not None:
+            _require_finite_num(height, "air_gap height")
+        cap = self._current_working_volume()
+        if self.current_volume + vol > cap + VOLUME_TOLERANCE:
             raise ValueError(
-                f"Cannot air_gap {volume} uL: exceeds max volume {self.effective_max_volume} uL"
+                f"Cannot air_gap {volume} uL: exceeds max volume {cap} uL"
             )
         self.current_volume += vol
         self._air_gap_volume += vol
@@ -402,7 +473,7 @@ class _MockInstrumentContext:
         air_expelled = min(self._air_gap_volume, vol)
         liquid_vol = max(0.0, vol - air_expelled)
         if isinstance(location, _MockTrash):
-            pass
+            self._last_well = None
         elif isinstance(location, (_MockWell, _MockLocation)):
             well = _unwrap_well_target(location, "dispense")
             if well.slot in self._ctx._slots and self._ctx._slots[well.slot].spec.is_tiprack:
@@ -410,6 +481,7 @@ class _MockInstrumentContext:
             affected, mult = self._resolve_well_channels(well, "dispense")
             for w in affected:
                 w._add_volume(liquid_vol * mult)
+            self._last_well = well
         else:
             raise ValueError(
                 f"dispense target must be a well or trash container (got '{type(location).__name__}')"
@@ -443,14 +515,22 @@ class _MockInstrumentContext:
         speed: float = 60.0,
     ) -> None:
         self._require_tip("touch_tip")
-        if location is not None and not isinstance(location, (_MockWell, _MockLocation)):
+        target_well: _MockWell | None
+        if location is None:
+            target_well = self._last_well
+        elif isinstance(location, _MockWell):
+            target_well = location
+        elif isinstance(location, _MockLocation):
+            target_well = location.well
+        else:
             raise ValueError(
                 f"touch_tip location must be a well or None (got '{type(location).__name__}')"
             )
         for val, name in ((radius, "radius"), (v_offset, "v_offset"), (speed, "speed")):
-            if isinstance(val, bool) or not isinstance(val, (int, float)):
-                raise ValueError(f"touch_tip {name} must be numeric, got {val!r}")
-        self._log.append(f"Touching tip at {location}" if location is not None else "Touching tip")
+            _require_finite_num(val, f"touch_tip {name}")
+        if target_well is not None and target_well.touch_tip_disabled:
+            return
+        self._log.append("Touching tip")
 
     def mix(self, repetitions: int, volume: float, location: Any) -> None:
         self._require_tip("mix")
@@ -477,20 +557,23 @@ class _MockInstrumentContext:
     def transfer(
         self,
         volume: float,
-        source: _MockWell | list[_MockWell],
-        dest: _MockWell | list[_MockWell],
+        source: _MockWell | _MockLocation | list[_MockWell | _MockLocation],
+        dest: _MockWell | _MockLocation | list[_MockWell | _MockLocation],
         *,
         new_tip: str = "once",
         mix_after: tuple[int, float] | None = None,
     ) -> None:
         if new_tip not in ("once", "always", "never"):
             raise ValueError(f"Invalid new_tip mode: {new_tip}")
-        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume <= 0:
+        vol = _require_finite_num(volume, "transfer volume")
+        if vol <= 0:
             raise ValueError(f"transfer volume must be positive, got {volume}")
-        vol = float(volume)
-        strokes = max(1, math.ceil((vol - VOLUME_TOLERANCE) / self.effective_max_volume))
-        stroke_vol = vol / strokes
-        self._check_vol(stroke_vol, "transfer")
+
+        eff_max = self._active_working_volume(new_tip)
+        stroke_groups = plan_transfer_strokes(vol, self.spec.max_volume, eff_max)
+        for grp in stroke_groups:
+            for s_vol in grp:
+                self._check_vol(s_vol, "transfer", max_cap=eff_max)
 
         srcs = list(source) if isinstance(source, (list, tuple)) else [source]
         dsts = list(dest) if isinstance(dest, (list, tuple)) else [dest]
@@ -503,7 +586,8 @@ class _MockInstrumentContext:
 
         self.max_op_volume_ul = max(self.max_op_volume_ul, vol)
         if mix_after is not None:
-            self.max_op_volume_ul = max(self.max_op_volume_ul, float(mix_after[1]))
+            mvol_checked = _require_finite_num(mix_after[1], "mix_after volume")
+            self.max_op_volume_ul = max(self.max_op_volume_ul, mvol_checked)
 
         prev_composite = self._in_composite_op
         self._in_composite_op = True
@@ -511,16 +595,17 @@ class _MockInstrumentContext:
             self.pick_up_tip()
         try:
             for src_well, dst_well in zip(srcs, dsts):
-                if new_tip == "always":
-                    self.pick_up_tip()
-                for _ in range(strokes):
-                    self.aspirate(stroke_vol, src_well)
-                    self.dispense(stroke_vol, dst_well)
-                if mix_after is not None:
-                    reps, mvol = mix_after
-                    self.mix(reps, mvol, dst_well)
-                if new_tip == "always":
-                    self.drop_tip()
+                for stroke_group in stroke_groups:
+                    if new_tip == "always":
+                        self.pick_up_tip()
+                    for stroke_vol in stroke_group:
+                        self.aspirate(stroke_vol, src_well)
+                        self.dispense(stroke_vol, dst_well)
+                        if mix_after is not None:
+                            reps, mvol = mix_after
+                            self.mix(reps, mvol, dst_well)
+                    if new_tip == "always":
+                        self.drop_tip()
         finally:
             try:
                 if new_tip == "once" and self.has_tip:
@@ -531,8 +616,8 @@ class _MockInstrumentContext:
     def distribute(
         self,
         volume: float,
-        source: _MockWell,
-        dest: list[_MockWell] | _MockWell,
+        source: _MockWell | _MockLocation,
+        dest: list[_MockWell | _MockLocation] | _MockWell | _MockLocation,
         *,
         new_tip: str = "once",
         disposal_volume: float | None = None,
@@ -540,15 +625,20 @@ class _MockInstrumentContext:
         if new_tip not in ("once", "never"):
             raise ValueError(f"distribute supports 'once' or 'never', got {new_tip}")
         dsts = list(dest) if isinstance(dest, (list, tuple)) else [dest]
-        self._check_vol(volume, "distribute")
+        eff_max = self._active_working_volume(new_tip)
+        self._check_vol(volume, "distribute", max_cap=eff_max)
         vol = float(volume)
-        disp_vol = self.spec.min_volume if disposal_volume is None else float(disposal_volume)
+        disp_vol = (
+            self.spec.min_volume
+            if disposal_volume is None
+            else _require_finite_num(disposal_volume, "distribute disposal_volume")
+        )
         if disp_vol < 0:
             raise ValueError(f"disposal_volume must be >= 0, got {disp_vol}")
-        if vol + disp_vol > self.effective_max_volume + VOLUME_TOLERANCE:
+        if vol + disp_vol > eff_max + VOLUME_TOLERANCE:
             raise ValueError(
                 f"distribute volume {volume} uL + disposal_volume {disp_vol} uL "
-                f"exceeds max volume {self.effective_max_volume} uL"
+                f"exceeds max volume {eff_max} uL"
             )
         trash = self._default_trash()
         self.max_op_volume_ul = max(self.max_op_volume_ul, vol)
@@ -558,16 +648,15 @@ class _MockInstrumentContext:
             self.pick_up_tip()
         try:
             idx = 0
-            batch_count = max(
-                1, int((self.effective_max_volume - disp_vol + VOLUME_TOLERANCE) // vol)
-            )
-            while idx < len(dsts):
-                chunk = dsts[idx : idx + batch_count]
+            chunks = plan_distribute_chunks(len(dsts), vol, eff_max, disp_vol)
+            for chunk_len in chunks:
+                chunk = dsts[idx : idx + chunk_len]
                 self.aspirate(vol * len(chunk) + disp_vol, source)
                 for dst_well in chunk:
                     self.dispense(vol, dst_well)
-                self.blow_out(trash)
-                idx += len(chunk)
+                if disp_vol > 0.0:
+                    self.blow_out(trash)
+                idx += chunk_len
         finally:
             try:
                 if new_tip == "once" and self.has_tip:
@@ -665,6 +754,10 @@ class MockProtocolContext:
         spec = get_pipette_spec(model)
         if spec is None:
             raise ValueError(f"Unknown pipette model: {model}")
+        if spec.channels not in (1, 8):
+            raise ValueError(
+                f"Unsupported pipette channel count {spec.channels} on '{model}'"
+            )
         if self.robot_type == "Flex":
             if not is_flex_pipette(model):
                 raise ValueError(
@@ -674,10 +767,6 @@ class MockProtocolContext:
             if is_flex_pipette(model):
                 raise ValueError(
                     f"Opentrons Flex pipette '{model}' requires requirements['robotType'] == 'Flex'"
-                )
-            if spec.channels > 1:
-                raise ValueError(
-                    f"Multichannel pipette '{model}' is not supported in OT-2 mock checker"
                 )
         racks = list(tip_racks or [])
         for rack in racks:
@@ -720,16 +809,11 @@ class MockProtocolContext:
         self.log.append(f"Comment: {msg}")
 
     def delay(self, seconds: float = 0, minutes: float = 0) -> None:
-        if (
-            isinstance(seconds, bool)
-            or isinstance(minutes, bool)
-            or not isinstance(seconds, (int, float))
-            or not isinstance(minutes, (int, float))
-            or seconds < 0
-            or minutes < 0
-        ):
+        sec_val = _require_finite_num(seconds, "delay seconds")
+        min_val = _require_finite_num(minutes, "delay minutes")
+        if sec_val < 0 or min_val < 0:
             raise ValueError("delay seconds and minutes must be >= 0")
-        total = float(seconds) + 60.0 * float(minutes)
+        total = sec_val + 60.0 * min_val
         self.log.append(f"Delaying for {total:.1f} seconds")
 
     def pause(self, msg: str = "") -> None:
@@ -1499,3 +1583,115 @@ def check_protocol(path: Path | str, *, use_mock: bool = False) -> CheckResult:
         if real_result is not None:
             return real_result
     return _check_with_mock(proto_path)
+
+
+PrimitiveAction = tuple[str, float | None, str | None, str | None]
+
+_PICK_UP_RE = re.compile(r"^Picking up tip from ([A-Z]+\d+) of .+ on slot ([A-Za-z0-9]+)$")
+_ASPIRATE_RE = re.compile(
+    r"^Aspirating ([0-9.]+) uL from ([A-Z]+\d+) of .+ on slot ([A-Za-z0-9]+)(?: at .+)?$"
+)
+_AIR_GAP_MOCK_RE = re.compile(r"^Air gap ([0-9.]+) uL$")
+_AIR_GAP_OT_RE = re.compile(r"^Air gap of ([0-9.]+) uL$")
+_DISPENSE_WELL_RE = re.compile(
+    r"^Dispensing ([0-9.]+) uL into ([A-Z]+\d+) of .+ on slot ([A-Za-z0-9]+)(?: at .+)?$"
+)
+_DISPENSE_TRASH_RE = re.compile(
+    r"^Dispensing ([0-9.]+) uL into Trash Bin on slot ([A-Za-z0-9]+)(?: at .+)?$"
+)
+_BLOW_OUT_WELL_RE = re.compile(
+    r"^Blowing out into ([A-Z]+\d+) of .+ on slot ([A-Za-z0-9]+)$"
+)
+_BLOW_OUT_TRASH_RE = re.compile(r"^Blowing out into Trash Bin on slot ([A-Za-z0-9]+)$")
+_DROP_TIP_TRASH_RE = re.compile(r"^Dropping tip into Trash Bin on slot ([A-Za-z0-9]+)$")
+_DROP_TIP_WELL_RE = re.compile(r"^Dropping tip into ([A-Z]+\d+) of .+ on slot ([A-Za-z0-9]+)$")
+_DELAY_MOCK_RE = re.compile(r"^Delaying for ([0-9.]+) seconds$")
+_DELAY_OT_RE = re.compile(r"^Delaying for (\d+) minutes and ([0-9.]+) seconds$")
+
+
+def _parse_primitive_line(text: str) -> PrimitiveAction | None:
+    stripped = text.strip()
+    m = _PICK_UP_RE.match(stripped)
+    if m:
+        return ("pick_up_tip", None, m.group(1), m.group(2))
+    m = _ASPIRATE_RE.match(stripped)
+    if m:
+        return ("aspirate", round(float(m.group(1)), 4), m.group(2), m.group(3))
+    m = _AIR_GAP_MOCK_RE.match(stripped) or _AIR_GAP_OT_RE.match(stripped)
+    if m:
+        return ("air_gap", round(float(m.group(1)), 4), None, None)
+    m = _DISPENSE_WELL_RE.match(stripped)
+    if m:
+        return ("dispense", round(float(m.group(1)), 4), m.group(2), m.group(3))
+    m = _DISPENSE_TRASH_RE.match(stripped)
+    if m:
+        return ("dispense", round(float(m.group(1)), 4), "TRASH", m.group(2))
+    m = _BLOW_OUT_TRASH_RE.match(stripped)
+    if m:
+        return ("blow_out", None, "TRASH", m.group(1))
+    m = _BLOW_OUT_WELL_RE.match(stripped)
+    if m:
+        return ("blow_out", None, m.group(1), m.group(2))
+    if stripped.startswith("Touching tip"):
+        return ("touch_tip", None, None, None)
+    m = _DROP_TIP_TRASH_RE.match(stripped)
+    if m:
+        return ("drop_tip", None, "TRASH", m.group(1))
+    m = _DROP_TIP_WELL_RE.match(stripped)
+    if m:
+        return ("drop_tip", None, m.group(1), m.group(2))
+    m = _DELAY_MOCK_RE.match(stripped)
+    if m:
+        return ("delay", round(float(m.group(1)), 4), None, None)
+    m = _DELAY_OT_RE.match(stripped)
+    if m:
+        total_s = 60.0 * float(m.group(1)) + float(m.group(2))
+        return ("delay", round(total_s, 4), None, None)
+    return None
+
+
+def reduce_mock_log_actions(lines: Sequence[str]) -> list[PrimitiveAction]:
+    """Reduce `MockProtocolContext` run-log lines to `(action, volume, well, slot)` tuples."""
+    actions: list[PrimitiveAction] = []
+    for line in lines:
+        parsed = _parse_primitive_line(line)
+        if parsed is not None:
+            actions.append(parsed)
+    return actions
+
+
+def reduce_opentrons_runlog_actions(runlog: Sequence[Mapping[str, Any]]) -> list[PrimitiveAction]:
+    """Reduce an `opentrons.simulate.simulate` runlog to `(action, volume, well, slot)` tuples."""
+    actions: list[PrimitiveAction] = []
+    skip_above_level: int | None = None
+
+    def _visit(node: Mapping[str, Any]) -> None:
+        nonlocal skip_above_level
+        raw_level = node.get("level")
+        level = raw_level if isinstance(raw_level, int) and not isinstance(raw_level, bool) else None
+        if skip_above_level is not None and level is not None:
+            if level > skip_above_level:
+                return
+            skip_above_level = None
+
+        payload = node.get("payload")
+        text = str(payload.get("text", "")).strip() if isinstance(payload, Mapping) else ""
+        ag_match = _AIR_GAP_OT_RE.match(text)
+        if ag_match:
+            actions.append(("air_gap", round(float(ag_match.group(1)), 4), None, None))
+            if level is not None:
+                skip_above_level = level
+            return
+        parsed = _parse_primitive_line(text)
+        if parsed is not None:
+            actions.append(parsed)
+        if level is None:
+            children = node.get("logs")
+            if isinstance(children, Sequence) and not isinstance(children, (str, bytes)):
+                for child in children:
+                    if isinstance(child, Mapping):
+                        _visit(child)
+
+    for entry in runlog:
+        _visit(entry)
+    return actions

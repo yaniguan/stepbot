@@ -236,7 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.envelope is not None:
                 args.envelope.parent.mkdir(parents=True, exist_ok=True)
                 args.envelope.write_text(
-                    json.dumps(bundle.envelope, indent=2) + "\n",
+                    json.dumps(bundle.envelope, indent=2, allow_nan=False) + "\n",
                     encoding="utf-8",
                     newline="\n",
                 )
@@ -253,6 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "envelope": bundle.envelope,
                     },
                     indent=2,
+                    allow_nan=False,
                 )
             )
         else:
@@ -341,13 +342,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (McpSecurityViolation, json.JSONDecodeError, ValueError, OSError, UnicodeDecodeError) as exc:
             if args.json:
                 rule = exc.rule if isinstance(exc, McpSecurityViolation) else "mcp_io_or_parse"
-                print(json.dumps({"ok": False, "rule": rule, "error": str(exc)}, indent=2))
+                print(
+                    json.dumps(
+                        {"ok": False, "rule": rule, "error": str(exc)},
+                        indent=2,
+                        allow_nan=False,
+                    )
+                )
             else:
                 print(f"MCP security deny: {exc}", file=sys.stderr)
             return 1
 
         if args.json:
-            print(json.dumps(receipt, indent=2))
+            print(json.dumps(receipt, indent=2, allow_nan=False))
         else:
             print(
                 f"DISPATCH OK ({receipt['backend']}): "

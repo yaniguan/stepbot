@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
+import math
+import re
 from typing import Any
 
 from stepbot.catalog import get_labware_spec, get_pipette_spec
@@ -90,15 +91,18 @@ def _extract_raw_steps(twinstep_data: dict[str, Any] | Sequence[Any]) -> tuple[s
 
 
 def _to_ul(volume: Any, unit: Any, label: str) -> float:
-    if isinstance(volume, bool) or not isinstance(volume, (int, float)):
-        raise ValidationError(f"{label}: volume must be a number, got {volume!r}")
+    if isinstance(volume, bool) or not isinstance(volume, (int, float)) or not math.isfinite(float(volume)):
+        raise ValidationError(f"{label}: volume must be a finite number, got {volume!r}")
     vol = float(volume)
     if vol <= 0:
         raise ValidationError(f"{label}: volume must be positive, got {vol}")
     if unit == "uL":
         return vol
     if unit == "mL":
-        return vol * 1000.0
+        scaled = vol * 1000.0
+        if not math.isfinite(scaled):
+            raise ValidationError(f"{label}: volume must be a finite number, got {volume!r}")
+        return scaled
     raise ValidationError(f"{label}: unsupported volume unit {unit!r} (expected 'uL' or 'mL')")
 
 
@@ -188,10 +192,20 @@ def from_twinstep(
             temp = step.get("temperature")
             duration = step.get("time")
             t_unit = step.get("time_unit", step.get("unit", "min"))
-            if isinstance(temp, bool) or not isinstance(temp, (int, float)) or temp <= -273.15:
+            if (
+                isinstance(temp, bool)
+                or not isinstance(temp, (int, float))
+                or not math.isfinite(float(temp))
+                or temp <= -273.15
+            ):
                 raise ValidationError(f"{label}: invalid temperature {temp!r}")
-            if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
-                raise ValidationError(f"{label}: duration must be positive, got {duration!r}")
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(float(duration))
+                or duration <= 0
+            ):
+                raise ValidationError(f"{label}: duration must be a positive finite number, got {duration!r}")
             if step.get("plate") is not None:
                 ensure_plate(str(step["plate"]))
             stepbot_steps.append(
